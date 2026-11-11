@@ -1,7 +1,8 @@
 use std::io;
 
-use columnar::{ColumnarWriter, NumericalValue};
+use columnar::{ColumnType, ColumnarWriter, NumericalValue};
 use common::{DateTimePrecision, JsonPathWriter};
+use stacker::Addr;
 use tokenizer_api::Token;
 
 use crate::indexer::doc_id_mapping::DocIdMapping;
@@ -14,16 +15,112 @@ use crate::{DocId, TantivyError};
 /// This is mostly to guard us from a stack overflow triggered by malicious input.
 const JSON_DEPTH_LIMIT: usize = 20;
 
+/// Where a fast-field leaf value should be recorded: at the cached column address (non-JSON fast
+/// fields, the common case) or by column name (the fallback).
+enum FastFieldTarget<'a> {
+    Addr(Addr),
+    Name(&'a str),
+}
+
+impl FastFieldTarget<'_> {
+    #[inline]
+    fn record_numerical(&self, writer: &mut ColumnarWriter, doc: DocId, value: NumericalValue) {
+        match self {
+            Self::Addr(addr) => writer.record_numerical_at(doc, *addr, value),
+            Self::Name(name) => writer.record_numerical(doc, name, value),
+        }
+    }
+
+    #[inline]
+    fn record_str(&self, writer: &mut ColumnarWriter, doc: DocId, value: &str) {
+        match self {
+            Self::Addr(addr) => writer.record_str_at(doc, *addr, value),
+            Self::Name(name) => writer.record_str(doc, name, value),
+        }
+    }
+
+    #[inline]
+    fn record_datetime(&self, writer: &mut ColumnarWriter, doc: DocId, value: common::DateTime) {
+        match self {
+            Self::Addr(addr) => writer.record_datetime_at(doc, *addr, value),
+            Self::Name(name) => writer.record_datetime(doc, name, value),
+        }
+    }
+
+    #[inline]
+    fn record_bool(&self, writer: &mut ColumnarWriter, doc: DocId, value: bool) {
+        match self {
+            Self::Addr(addr) => writer.record_bool_at(doc, *addr, value),
+            Self::Name(name) => writer.record_bool(doc, name, value),
+        }
+    }
+
+    #[inline]
+    fn record_ip_addr(&self, writer: &mut ColumnarWriter, doc: DocId, value: std::net::Ipv6Addr) {
+        match self {
+            Self::Addr(addr) => writer.record_ip_addr_at(doc, *addr, value),
+            Self::Name(name) => writer.record_ip_addr(doc, name, value),
+        }
+    }
+
+    #[inline]
+    fn record_bytes(&self, writer: &mut ColumnarWriter, doc: DocId, value: &[u8]) {
+        match self {
+            Self::Addr(addr) => writer.record_bytes_at(doc, *addr, value),
+            Self::Name(name) => writer.record_bytes(doc, name, value),
+        }
+    }
+}
+
+/// The `ColumnType` of the `ColumnarWriter` column a fast-field leaf value is recorded into.
+///
+/// A document may carry a value whose type does not match the field's declared type (tantivy
+/// accepts it and records it in a different map, under the same name). `add_doc_value` uses this
+/// to check that the column address cached for the field belongs to the map the leaf targets.
+fn leaf_column_type(leaf: &ReferenceValueLeaf<'_>) -> Option<ColumnType> {
+    match leaf {
+        ReferenceValueLeaf::Null => None,
+        ReferenceValueLeaf::Str(_)
+        | ReferenceValueLeaf::Facet(_)
+        | ReferenceValueLeaf::PreTokStr(_) => Some(ColumnType::Str),
+        ReferenceValueLeaf::U64(_) => Some(ColumnType::U64),
+        ReferenceValueLeaf::I64(_) => Some(ColumnType::I64),
+        ReferenceValueLeaf::F64(_) => Some(ColumnType::F64),
+        ReferenceValueLeaf::Date(_) => Some(ColumnType::DateTime),
+        ReferenceValueLeaf::Bytes(_) => Some(ColumnType::Bytes),
+        ReferenceValueLeaf::IpAddr(_) => Some(ColumnType::IpAddr),
+        ReferenceValueLeaf::Bool(_) => Some(ColumnType::Bool),
+        ReferenceValueLeaf::Custom(_) => None,
+    }
+}
+
 /// The `FastFieldsWriter` groups all of the fast field writers.
 pub struct FastFieldsWriter {
     columnar_writer: ColumnarWriter,
     fast_field_names: Vec<Option<String>>, //< TODO see if we can hash the field name hash too.
+    // Address of the `ColumnWriter` registered in the `ColumnarWriter` for a non-JSON fast field.
+    // The address is stable for the lifetime of the writer, so `add_doc_value` can update the
+    // column in place instead of looking it up by name on every value. JSON fast fields and
+    // tie-breaker columns have no entry here (`None`).
+    fast_field_addrs: Vec<Option<Addr>>,
+    // The `ColumnType` of the column `fast_field_addrs` points at. A document value whose type
+    // does not match the field's declared type is recorded in a different `ColumnarWriter` map
+    // (under the same name); `add_doc_value` falls back to the name-based path for those, so this
+    // is used to confirm the cached address belongs to the map the value would be recorded in.
+    fast_field_column_types: Vec<Option<ColumnType>>,
     per_field_tokenizer: Vec<Option<TextAnalyzer>>,
     date_precisions: Vec<DateTimePrecision>,
     expand_dots: Vec<bool>,
     num_docs: DocId,
     // Buffer that we recycle to avoid allocation.
     json_path_buffer: JsonPathWriter,
+    // Test-only counters proving the mechanism: a non-JSON fast-field leaf takes the
+    // cached-address path (which never hashes the column name) and the name-based fallback is not
+    // used.
+    #[cfg(test)]
+    leaf_addr_path_count: usize,
+    #[cfg(test)]
+    leaf_name_path_count: usize,
 }
 
 impl FastFieldsWriter {
@@ -41,6 +138,8 @@ impl FastFieldsWriter {
         let mut columnar_writer = ColumnarWriter::default();
 
         let mut fast_field_names: Vec<Option<String>> = vec![None; schema.num_fields()];
+        let mut fast_field_addrs: Vec<Option<Addr>> = vec![None; schema.num_fields()];
+        let mut fast_field_column_types: Vec<Option<ColumnType>> = vec![None; schema.num_fields()];
         let mut date_precisions: Vec<DateTimePrecision> =
             std::iter::repeat_with(DateTimePrecision::default)
                 .take(schema.num_fields())
@@ -94,21 +193,29 @@ impl FastFieldsWriter {
 
             let sort_values_within_row = value_type == Type::Facet;
             if let Some(column_type) = value_type_to_column_type(value_type) {
-                columnar_writer.record_column_type(
+                let addr = columnar_writer.record_column_type(
                     field_entry.name(),
                     column_type,
                     sort_values_within_row,
                 );
+                fast_field_addrs[field_id.field_id() as usize] = Some(addr);
+                fast_field_column_types[field_id.field_id() as usize] = Some(column_type);
             }
         }
         Ok(FastFieldsWriter {
             columnar_writer,
             fast_field_names,
+            fast_field_addrs,
+            fast_field_column_types,
             per_field_tokenizer,
             num_docs: 0u32,
             date_precisions,
             expand_dots,
             json_path_buffer: JsonPathWriter::default(),
+            #[cfg(test)]
+            leaf_addr_path_count: 0,
+            #[cfg(test)]
+            leaf_name_path_count: 0,
         })
     }
 
@@ -151,72 +258,109 @@ impl FastFieldsWriter {
         };
 
         match value.as_value() {
-            ReferenceValue::Leaf(leaf) => match leaf {
-                ReferenceValueLeaf::Null => {}
-                ReferenceValueLeaf::Str(val) => {
-                    if let Some(tokenizer) =
-                        &mut self.per_field_tokenizer[field.field_id() as usize]
+            ReferenceValue::Leaf(leaf) => {
+                // A fast, non-JSON leaf field has its column registered in the `ColumnarWriter` at
+                // schema setup; that address is stable, so the value can be recorded in place
+                // without hashing/probing the column name on every value. A document value whose
+                // type does not match the field's declared type (tantivy accepts it) is recorded
+                // in a different `ColumnarWriter` map, so the cached address is only used when it
+                // points at the map the leaf targets; otherwise fall back to the name-based path.
+                // (`Custom` fields are never fast, so they never reach here; JSON fast fields take
+                // the `Object` branch below.)
+                let field_id = field.field_id() as usize;
+                let addr_opt = match (
+                    self.fast_field_addrs[field_id],
+                    self.fast_field_column_types[field_id],
+                ) {
+                    (Some(addr), Some(column_type))
+                        if leaf_column_type(&leaf) == Some(column_type) =>
                     {
-                        let mut token_stream = tokenizer.token_stream(val);
-                        token_stream.process(&mut |token: &Token| {
-                            self.columnar_writer
-                                .record_str(doc_id, field_name, &token.text);
-                        })
-                    } else {
-                        self.columnar_writer.record_str(doc_id, field_name, val);
+                        Some(addr)
+                    }
+                    _ => None,
+                };
+                let target = match addr_opt {
+                    Some(addr) => {
+                        #[cfg(test)]
+                        {
+                            self.leaf_addr_path_count += 1;
+                        }
+                        FastFieldTarget::Addr(addr)
+                    }
+                    None => {
+                        #[cfg(test)]
+                        {
+                            self.leaf_name_path_count += 1;
+                        }
+                        FastFieldTarget::Name(field_name)
+                    }
+                };
+                match leaf {
+                    ReferenceValueLeaf::Null => {}
+                    ReferenceValueLeaf::Str(val) => {
+                        if let Some(tokenizer) = &mut self.per_field_tokenizer[field_id] {
+                            let mut token_stream = tokenizer.token_stream(val);
+                            token_stream.process(&mut |token: &Token| {
+                                target.record_str(&mut self.columnar_writer, doc_id, &token.text);
+                            })
+                        } else {
+                            target.record_str(&mut self.columnar_writer, doc_id, val);
+                        }
+                    }
+                    ReferenceValueLeaf::U64(val) => {
+                        target.record_numerical(
+                            &mut self.columnar_writer,
+                            doc_id,
+                            NumericalValue::from(val),
+                        );
+                    }
+                    ReferenceValueLeaf::I64(val) => {
+                        target.record_numerical(
+                            &mut self.columnar_writer,
+                            doc_id,
+                            NumericalValue::from(val),
+                        );
+                    }
+                    ReferenceValueLeaf::F64(val) => {
+                        target.record_numerical(
+                            &mut self.columnar_writer,
+                            doc_id,
+                            NumericalValue::from(val),
+                        );
+                    }
+                    ReferenceValueLeaf::Date(val) => {
+                        let date_precision = self.date_precisions[field_id];
+                        let truncated_datetime = val.truncate(date_precision);
+                        target.record_datetime(
+                            &mut self.columnar_writer,
+                            doc_id,
+                            truncated_datetime,
+                        );
+                    }
+                    ReferenceValueLeaf::Facet(val) => {
+                        target.record_str(&mut self.columnar_writer, doc_id, val);
+                    }
+                    ReferenceValueLeaf::Bytes(val) => {
+                        target.record_bytes(&mut self.columnar_writer, doc_id, val);
+                    }
+                    ReferenceValueLeaf::IpAddr(val) => {
+                        target.record_ip_addr(&mut self.columnar_writer, doc_id, val);
+                    }
+                    ReferenceValueLeaf::Bool(val) => {
+                        target.record_bool(&mut self.columnar_writer, doc_id, val);
+                    }
+                    ReferenceValueLeaf::PreTokStr(val) => {
+                        for token in &val.tokens {
+                            target.record_str(&mut self.columnar_writer, doc_id, &token.text);
+                        }
+                    }
+                    // Custom fields are never fast (`is_fast() == false`), so they are not
+                    // registered in `fast_field_names` and `add_doc_value` returns early above.
+                    ReferenceValueLeaf::Custom(_) => {
+                        unreachable!("the fast field writer does not support custom field types")
                     }
                 }
-                ReferenceValueLeaf::U64(val) => {
-                    self.columnar_writer.record_numerical(
-                        doc_id,
-                        field_name,
-                        NumericalValue::from(val),
-                    );
-                }
-                ReferenceValueLeaf::I64(val) => {
-                    self.columnar_writer.record_numerical(
-                        doc_id,
-                        field_name,
-                        NumericalValue::from(val),
-                    );
-                }
-                ReferenceValueLeaf::F64(val) => {
-                    self.columnar_writer.record_numerical(
-                        doc_id,
-                        field_name,
-                        NumericalValue::from(val),
-                    );
-                }
-                ReferenceValueLeaf::Date(val) => {
-                    let date_precision = self.date_precisions[field.field_id() as usize];
-                    let truncated_datetime = val.truncate(date_precision);
-                    self.columnar_writer
-                        .record_datetime(doc_id, field_name, truncated_datetime);
-                }
-                ReferenceValueLeaf::Facet(val) => {
-                    self.columnar_writer.record_str(doc_id, field_name, val);
-                }
-                ReferenceValueLeaf::Bytes(val) => {
-                    self.columnar_writer.record_bytes(doc_id, field_name, val);
-                }
-                ReferenceValueLeaf::IpAddr(val) => {
-                    self.columnar_writer.record_ip_addr(doc_id, field_name, val);
-                }
-                ReferenceValueLeaf::Bool(val) => {
-                    self.columnar_writer.record_bool(doc_id, field_name, val);
-                }
-                ReferenceValueLeaf::PreTokStr(val) => {
-                    for token in &val.tokens {
-                        self.columnar_writer
-                            .record_str(doc_id, field_name, &token.text);
-                    }
-                }
-                // Custom fields are never fast (`is_fast() == false`), so they are not registered
-                // in `fast_field_names` and `add_doc_value` returns early above.
-                ReferenceValueLeaf::Custom(_) => {
-                    unreachable!("the fast field writer does not support custom field types")
-                }
-            },
+            }
             ReferenceValue::Array(val) => {
                 // TODO: Check this is the correct behaviour we want.
                 for value in val {
@@ -532,5 +676,73 @@ mod tests {
             columns[0].0,
             "field\u{1}with\u{1}dots\u{1}child\u{1}with\u{1}dot"
         );
+    }
+
+    #[test]
+    fn test_fast_field_addrs_for_non_json_fast_fields() {
+        let mut schema_builder = Schema::builder();
+        let num_field = schema_builder.add_u64_field("num", FAST);
+        let text_field = schema_builder.add_text_field("text", FAST);
+        let json_field = schema_builder.add_json_field("json", FAST);
+        let schema = schema_builder.build();
+
+        let mut writer = FastFieldsWriter::from_schema(&schema).unwrap();
+        // Non-JSON fast fields cache the address of their column in the `ColumnarWriter`; JSON fast
+        // fields do not, because their columns are created dynamically per JSON path.
+        assert!(writer.fast_field_addrs[num_field.field_id() as usize].is_some());
+        assert!(writer.fast_field_addrs[text_field.field_id() as usize].is_some());
+        assert!(writer.fast_field_addrs[json_field.field_id() as usize].is_none());
+
+        writer
+            .add_document(&crate::doc!(num_field => 42u64, text_field => "hello"))
+            .unwrap();
+        writer
+            .add_document(&crate::doc!(num_field => 7u64, text_field => "world"))
+            .unwrap();
+
+        let mut buffer = Vec::new();
+        writer.serialize(&mut buffer, None).unwrap();
+        let reader = ColumnarReader::open(buffer).unwrap();
+        let columns = reader.list_columns().unwrap();
+        let num_column: Option<Column<u64>> = columns
+            .iter()
+            .find(|(name, _)| name.as_str() == "num")
+            .unwrap()
+            .1
+            .open()
+            .unwrap()
+            .into();
+        let num_column = num_column.unwrap();
+        assert_eq!(
+            num_column.values_for_doc(0).collect::<Vec<_>>(),
+            vec![42u64]
+        );
+        assert_eq!(num_column.values_for_doc(1).collect::<Vec<_>>(), vec![7u64]);
+    }
+
+    /// Mechanism count: over a non-JSON fast field, every leaf value takes the cached-address path
+    /// (`FastFieldTarget::Addr`, which never calls `get_hash`/`get_value_addr_if_key_match`) and
+    /// the name-based fallback is not used.
+    #[test]
+    fn test_add_doc_value_uses_cached_addr_for_non_json_fast_fields() {
+        let mut schema_builder = Schema::builder();
+        let num_field = schema_builder.add_u64_field("num", FAST);
+        let text_field = schema_builder.add_text_field("text", FAST);
+        let schema = schema_builder.build();
+
+        let mut writer = FastFieldsWriter::from_schema(&schema).unwrap();
+        assert_eq!(writer.leaf_addr_path_count, 0);
+        assert_eq!(writer.leaf_name_path_count, 0);
+
+        writer
+            .add_document(&crate::doc!(num_field => 42u64, text_field => "hello"))
+            .unwrap();
+        writer
+            .add_document(&crate::doc!(num_field => 7u64, text_field => "world"))
+            .unwrap();
+
+        // 2 numerical + 2 text leaf values, all via the cached address, zero name lookups.
+        assert_eq!(writer.leaf_addr_path_count, 4);
+        assert_eq!(writer.leaf_name_path_count, 0);
     }
 }

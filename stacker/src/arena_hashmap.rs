@@ -83,6 +83,37 @@ impl ArenaHashMap {
         self.shared_arena_hashmap
             .mutate_or_create(key, &mut self.memory_arena, updater);
     }
+
+    /// Same as [`ArenaHashMap::mutate_or_create`], but also returns the address of the value in
+    /// the map's memory arena.
+    ///
+    /// The address stays valid for the lifetime of the value (the arena is append-only, so
+    /// resizing the key/value table does not move it). It can be cached and passed to
+    /// [`ArenaHashMap::mutate_at`] to update the value without hashing or probing the key again.
+    #[inline]
+    pub fn mutate_or_create_addr<V>(
+        &mut self,
+        key: &[u8],
+        updater: impl FnMut(Option<V>) -> V,
+    ) -> (V, Addr)
+    where
+        V: Copy + 'static,
+    {
+        self.shared_arena_hashmap
+            .mutate_or_create_addr(key, &mut self.memory_arena, updater)
+    }
+
+    /// Updates in place the value stored at `val_addr` in the map's memory arena.
+    ///
+    /// `val_addr` must have been obtained from [`ArenaHashMap::mutate_or_create_addr`] and still
+    /// be valid. This skips the key hash, the probe and the key comparison of
+    /// `mutate_or_create`.
+    #[inline]
+    pub fn mutate_at<V>(&mut self, val_addr: Addr, updater: impl FnOnce(&mut V))
+    where V: Copy + 'static {
+        self.shared_arena_hashmap
+            .mutate_at(val_addr, &mut self.memory_arena, updater);
+    }
 }
 
 #[cfg(test)]
@@ -91,6 +122,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::ArenaHashMap;
+    use crate::Addr;
 
     #[test]
     fn test_hash_map() {
@@ -115,6 +147,33 @@ mod tests {
         }
         assert_eq!(vanilla_hash_map.len(), 2);
     }
+    #[test]
+    fn test_mutate_or_create_addr_and_mutate_at_across_resize() {
+        let mut hash_map: ArenaHashMap = ArenaHashMap::default();
+        let mut addrs: Vec<(String, u32, Addr)> = Vec::new();
+        for i in 0..16u32 {
+            let key = format!("key-{i}");
+            let (val, addr) = hash_map.mutate_or_create_addr(key.as_bytes(), |opt: Option<u32>| {
+                assert_eq!(opt, None);
+                i
+            });
+            assert_eq!(val, i);
+            addrs.push((key, i, addr));
+        }
+        // Force several resizes of the key/value table.
+        for i in 16..100_000u32 {
+            hash_map.mutate_or_create(format!("other-{i}").as_bytes(), |_| 0u32);
+        }
+        for (key, original, addr) in &addrs {
+            hash_map.mutate_at(*addr, |val: &mut u32| {
+                *val += 1000;
+            });
+            let after: u32 = hash_map.read(*addr);
+            assert_eq!(after, original + 1000);
+            assert_eq!(hash_map.get::<u32>(key.as_bytes()), Some(after));
+        }
+    }
+
     #[test]
     fn test_empty_hashmap() {
         let hash_map: ArenaHashMap = ArenaHashMap::default();
