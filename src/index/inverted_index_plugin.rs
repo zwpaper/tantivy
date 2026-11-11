@@ -17,11 +17,11 @@ use measure_time::debug_time;
 use tokenizer_api::BoxTokenStream;
 
 use crate::directory::{CompositeFile, Directory};
-use crate::docset::DocSet;
+use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
 use crate::index::{Segment, SegmentComponent, SegmentReader};
-use crate::indexer::doc_id_mapping::{DocIdMapping, SegmentDocIdMapping};
+use crate::indexer::doc_id_mapping::{DocIdMapping, MappingType, SegmentDocIdMapping};
 use crate::indexer::indexing_term::IndexingTerm;
 use crate::json_utils::{index_json_value, IndexingPositionsPerPath};
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
@@ -542,6 +542,55 @@ fn estimate_total_num_tokens(readers: &[SegmentReader], field: Field) -> crate::
     Ok(total_num_tokens)
 }
 
+/// Whether the merge needs a materialized `merged_doc_id_map`.
+///
+/// A delete-free `Stacked` mapping is affine (`mapped = segment_base_doc_id[segment_ord] + local`),
+/// so its table is never built; `StackedWithDeletes` and `Shuffled` still need it.
+fn needs_merged_doc_id_map(mapping_type: MappingType) -> bool {
+    mapping_type != MappingType::Stacked
+}
+
+/// Whether the merge needs a [`PostingsMerger`]. Only `Shuffled` reorders documents across
+/// segments; the two stacked mappings walk each segment's postings in order.
+fn needs_postings_merger(mapping_type: MappingType) -> bool {
+    mapping_type == MappingType::Shuffled
+}
+
+/// The mapped doc id of local doc `d` in segment `s` is `segment_base_doc_id[s] + d` for a
+/// delete-free `Stacked` merge: the running sum of the segments' `max_doc()` (which equals
+/// `num_docs()` when there are no deletes). It is field-independent, so it is computed once per
+/// merge.
+fn compute_segment_base_doc_id(readers: &[SegmentReader]) -> Vec<DocId> {
+    let mut base = Vec::with_capacity(readers.len());
+    let mut next_base: DocId = 0;
+    for reader in readers {
+        base.push(next_base);
+        next_base += reader.max_doc();
+    }
+    base
+}
+
+/// Builds `merged_doc_id_map[segment_ord][local_doc] = Some(mapped_doc)` for the mapping types that
+/// need it. Returns an empty vector for a delete-free `Stacked` mapping (see
+/// [`needs_merged_doc_id_map`]).
+fn build_merged_doc_id_map(
+    readers: &[SegmentReader],
+    doc_id_mapping: &SegmentDocIdMapping,
+) -> Vec<Vec<Option<DocId>>> {
+    if !needs_merged_doc_id_map(doc_id_mapping.mapping_type()) {
+        return Vec::new();
+    }
+    let mut merged_doc_id_map: Vec<Vec<Option<DocId>>> = readers
+        .iter()
+        .map(|reader| vec![None; reader.max_doc() as usize])
+        .collect();
+    for (new_doc_id, old_doc_addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
+        let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
+        segment_map[old_doc_addr.doc_id as usize] = Some(new_doc_id as DocId);
+    }
+    merged_doc_id_map
+}
+
 fn write_postings_for_field(
     readers: &[SegmentReader],
     schema: &Schema,
@@ -549,6 +598,7 @@ fn write_postings_for_field(
     serializer: &mut InvertedIndexSerializer,
     fieldnorm_reader: Option<FieldNormReader>,
     doc_id_mapping: &SegmentDocIdMapping,
+    segment_base_doc_id: &[DocId],
 ) -> crate::Result<()> {
     debug_time!("write-postings-for-field");
     let mut positions_buffer: Vec<u32> = Vec::with_capacity(1_000);
@@ -570,18 +620,8 @@ fn write_postings_for_field(
 
     let mut merged_terms = TermMerger::new(field_term_streams);
 
-    let mut merged_doc_id_map: Vec<Vec<Option<DocId>>> = readers
-        .iter()
-        .map(|reader| {
-            let mut segment_local_map = vec![];
-            segment_local_map.resize(reader.max_doc() as usize, None);
-            segment_local_map
-        })
-        .collect();
-    for (new_doc_id, old_doc_addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
-        let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
-        segment_map[old_doc_addr.doc_id as usize] = Some(new_doc_id as DocId);
-    }
+    let mapping_type = doc_id_mapping.mapping_type();
+    let merged_doc_id_map = build_merged_doc_id_map(readers, doc_id_mapping);
 
     let total_num_tokens: u64 = estimate_total_num_tokens(readers, indexed_field)?;
 
@@ -596,7 +636,8 @@ fn write_postings_for_field(
     );
 
     let mut segment_postings_containing_the_term: Vec<(usize, SegmentPostings)> = vec![];
-    let mut merger = PostingsMerger::new(&merged_doc_id_map);
+    let mut merger =
+        needs_postings_merger(mapping_type).then(|| PostingsMerger::new(&merged_doc_id_map));
 
     while merged_terms.advance() {
         segment_postings_containing_the_term.clear();
@@ -646,34 +687,61 @@ fn write_postings_for_field(
 
         field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
 
-        if doc_id_mapping.is_trivial() {
-            for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
-                let mapping = &merged_doc_id_map[segment_ord];
-                while let Some(doc) = crate::postings::next_mapped_doc(&mut postings, mapping) {
+        match mapping_type {
+            MappingType::Stacked => {
+                // Delete-free stacked merge: the mapping is affine (`base[s] + local`), so remap
+                // arithmetically instead of loading an `Option<DocId>` table per posting.
+                for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
+                    let base = segment_base_doc_id[segment_ord];
+                    while postings.doc() != TERMINATED {
+                        let doc = base + postings.doc();
+                        let term_freq = if has_term_freq {
+                            postings.positions(&mut positions_buffer);
+                            postings.term_freq()
+                        } else {
+                            positions_buffer.clear();
+                            0
+                        };
+                        let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                        field_serializer.write_doc(doc, term_freq, delta_positions);
+                        postings.advance();
+                    }
+                }
+            }
+            MappingType::StackedWithDeletes => {
+                // Deleted docs must still be skipped, so this keeps the mapped table.
+                for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
+                    let mapping = &merged_doc_id_map[segment_ord];
+                    while let Some(doc) = crate::postings::next_mapped_doc(&mut postings, mapping) {
+                        let term_freq = if has_term_freq {
+                            postings.positions(&mut positions_buffer);
+                            postings.term_freq()
+                        } else {
+                            positions_buffer.clear();
+                            0
+                        };
+                        let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                        field_serializer.write_doc(doc, term_freq, delta_positions);
+                        postings.advance();
+                    }
+                }
+            }
+            MappingType::Shuffled => {
+                let merger = merger
+                    .as_mut()
+                    .expect("Shuffled doc-id mapping needs a PostingsMerger");
+                merger.reset(segment_postings_containing_the_term.drain(..));
+                while merger.advance() {
                     let term_freq = if has_term_freq {
-                        postings.positions(&mut positions_buffer);
-                        postings.term_freq()
+                        merger.positions(&mut positions_buffer);
+                        merger.term_freq()
                     } else {
                         positions_buffer.clear();
                         0
                     };
                     let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                    field_serializer.write_doc(doc, term_freq, delta_positions);
-                    postings.advance();
+                    field_serializer.write_doc(merger.doc(), term_freq, delta_positions);
                 }
-            }
-        } else {
-            merger.reset(segment_postings_containing_the_term.drain(..));
-            while merger.advance() {
-                let term_freq = if has_term_freq {
-                    merger.positions(&mut positions_buffer);
-                    merger.term_freq()
-                } else {
-                    positions_buffer.clear();
-                    0
-                };
-                let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                field_serializer.write_doc(merger.doc(), term_freq, delta_positions);
             }
         }
         field_serializer.close_term()?;
@@ -689,6 +757,9 @@ fn write_postings_merge(
     fieldnorm_readers: FieldNormReaders,
     doc_id_mapping: &SegmentDocIdMapping,
 ) -> crate::Result<()> {
+    // Field-independent: the per-segment base doc id of a delete-free `Stacked` merge. Computed
+    // once per merge instead of rebuilding a `Vec<Vec<Option<DocId>>>` per indexed field.
+    let segment_base_doc_id = compute_segment_base_doc_id(readers);
     for (field, field_entry) in schema.fields() {
         let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
         if field_entry.is_indexed() {
@@ -699,6 +770,7 @@ fn write_postings_merge(
                 serializer,
                 fieldnorm_reader,
                 doc_id_mapping,
+                &segment_base_doc_id,
             )?;
         }
     }
@@ -707,6 +779,19 @@ fn write_postings_merge(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{
+        build_merged_doc_id_map, compute_segment_base_doc_id, needs_merged_doc_id_map,
+        needs_postings_merger,
+    };
+    use crate::directory::RamDirectory;
+    use crate::docset::{DocSet, TERMINATED};
+    use crate::index::SegmentReader;
+    use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
+    use crate::indexer::{merge_filtered_segments, NoMergePolicy};
+    use crate::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
+    use crate::{DocAddress, DocId, Index, Segment, Term};
 
     #[cfg(not(feature = "compare_hash_only"))]
     #[test]
@@ -718,5 +803,249 @@ mod tests {
         assert_eq!(compute_initial_table_size(15_000_000).unwrap(), 1 << 19);
         assert_eq!(compute_initial_table_size(1_000_000_000).unwrap(), 1 << 19);
         assert_eq!(compute_initial_table_size(4_000_000_000).unwrap(), 1 << 19);
+    }
+
+    /// The old unconditional map build (before the `Stacked` arithmetic specialization), kept here
+    /// as the reference the new path must match.
+    fn reference_merged_doc_id_map(
+        readers: &[SegmentReader],
+        doc_id_mapping: &SegmentDocIdMapping,
+    ) -> Vec<Vec<Option<DocId>>> {
+        let mut map: Vec<Vec<Option<DocId>>> = readers
+            .iter()
+            .map(|reader| vec![None; reader.max_doc() as usize])
+            .collect();
+        for (new_doc_id, old_doc_addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
+            map[old_doc_addr.segment_ord as usize][old_doc_addr.doc_id as usize] =
+                Some(new_doc_id as DocId);
+        }
+        map
+    }
+
+    /// The single raw term of every local doc of a segment (empty for a doc with no posting).
+    fn doc_terms(reader: &SegmentReader, field: Field) -> Vec<String> {
+        let inverted_index = reader.inverted_index(field).unwrap();
+        let mut out = vec![String::new(); reader.max_doc() as usize];
+        let mut term_stream = inverted_index.terms().stream().unwrap();
+        while term_stream.advance() {
+            let term = String::from_utf8(term_stream.key().to_vec()).unwrap();
+            let mut postings = inverted_index
+                .read_postings(
+                    &Term::from_field_text(field, &term),
+                    IndexRecordOption::Basic,
+                )
+                .unwrap()
+                .unwrap();
+            while postings.doc() != TERMINATED {
+                out[postings.doc() as usize] = term.clone();
+                postings.advance();
+            }
+        }
+        out
+    }
+
+    /// The merged `term -> doc ids` implied by `doc_id_mapping`, independent of the (arbitrary)
+    /// order in which `searchable_segments()` returns the source segments.
+    fn expected_postings(
+        readers: &[SegmentReader],
+        field: Field,
+        doc_id_mapping: &SegmentDocIdMapping,
+    ) -> BTreeMap<String, Vec<DocId>> {
+        let reference = reference_merged_doc_id_map(readers, doc_id_mapping);
+        let mut expected: BTreeMap<String, Vec<DocId>> = BTreeMap::new();
+        for (segment_ord, reader) in readers.iter().enumerate() {
+            for (local, term) in doc_terms(reader, field).iter().enumerate() {
+                if let Some(new_doc_id) = reference[segment_ord][local] {
+                    expected.entry(term.clone()).or_default().push(new_doc_id);
+                }
+            }
+        }
+        expected
+    }
+
+    /// One in-RAM segment per entry of `docs_per_segment`, one raw indexed text field.
+    fn build_raw_segments(docs_per_segment: &[&[&str]]) -> (Index, Vec<Segment>) {
+        let mut schema_builder = Schema::builder();
+        let body = schema_builder.add_text_field(
+            "body",
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("raw")
+                    .set_index_option(IndexRecordOption::Basic),
+            ),
+        );
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for docs in docs_per_segment {
+                for value in *docs {
+                    writer.add_document(doc!(body => *value)).unwrap();
+                }
+                writer.commit().unwrap();
+            }
+        }
+        let segments = index.searchable_segments().unwrap();
+        (index, segments)
+    }
+
+    fn open_readers(segments: &[Segment]) -> Vec<SegmentReader> {
+        segments
+            .iter()
+            .map(SegmentReader::open)
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// The old doc addresses in merged order: segments stacked, alive docs in order.
+    fn concatenated_doc_addrs(readers: &[SegmentReader]) -> Vec<DocAddress> {
+        readers
+            .iter()
+            .enumerate()
+            .flat_map(|(segment_ord, reader)| {
+                reader.doc_ids_alive().map(move |doc_id| DocAddress {
+                    segment_ord: segment_ord as u32,
+                    doc_id,
+                })
+            })
+            .collect()
+    }
+
+    /// `term -> doc ids` of a single-segment index.
+    fn postings_by_term(reader: &SegmentReader, field: Field) -> BTreeMap<String, Vec<DocId>> {
+        let inverted_index = reader.inverted_index(field).unwrap();
+        let mut out = BTreeMap::new();
+        let mut term_stream = inverted_index.terms().stream().unwrap();
+        while term_stream.advance() {
+            let term = String::from_utf8(term_stream.key().to_vec()).unwrap();
+            let mut postings = inverted_index
+                .read_postings(
+                    &Term::from_field_text(field, &term),
+                    IndexRecordOption::Basic,
+                )
+                .unwrap()
+                .unwrap();
+            let mut docs = Vec::new();
+            while postings.doc() != TERMINATED {
+                docs.push(postings.doc());
+                postings.advance();
+            }
+            out.insert(term, docs);
+        }
+        out
+    }
+
+    fn merge_all(index: &Index, segments: &[Segment]) -> Index {
+        merge_filtered_segments(
+            segments,
+            index.settings().clone(),
+            vec![None; segments.len()],
+            RamDirectory::create(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_merge_stacked_matches_reference() {
+        let docs_per_segment: Vec<&[&str]> = vec![&["a", "b", "a"], &["a", "c"], &["b", "a"]];
+        let (index, segments) = build_raw_segments(&docs_per_segment);
+        let readers = open_readers(&segments);
+        let body = index.schema().get_field("body").unwrap();
+
+        let stacked = SegmentDocIdMapping::new(
+            concatenated_doc_addrs(&readers),
+            MappingType::Stacked,
+            vec![None; readers.len()],
+        );
+
+        // The `Stacked` path builds neither the per-segment map nor a `PostingsMerger`.
+        assert!(!needs_merged_doc_id_map(MappingType::Stacked));
+        assert!(!needs_postings_merger(MappingType::Stacked));
+        assert!(build_merged_doc_id_map(&readers, &stacked).is_empty());
+
+        // `base[s] + local` equals the old per-field map for every alive doc.
+        let base = compute_segment_base_doc_id(&readers);
+        let reference = reference_merged_doc_id_map(&readers, &stacked);
+        for (new_doc_id, addr) in stacked.iter_old_doc_addrs().enumerate() {
+            let segment_ord = addr.segment_ord as usize;
+            assert_eq!(
+                reference[segment_ord][addr.doc_id as usize],
+                Some(new_doc_id as DocId)
+            );
+            assert_eq!(base[segment_ord] + addr.doc_id, new_doc_id as DocId);
+        }
+
+        // A forced `Shuffled` control still needs the map, and there `base[s] + local` is wrong.
+        let mut shuffled_addrs = concatenated_doc_addrs(&readers);
+        shuffled_addrs.reverse();
+        let shuffled = SegmentDocIdMapping::new(
+            shuffled_addrs,
+            MappingType::Shuffled,
+            vec![None; readers.len()],
+        );
+        assert!(needs_merged_doc_id_map(MappingType::Shuffled));
+        assert!(needs_postings_merger(MappingType::Shuffled));
+        assert!(!build_merged_doc_id_map(&readers, &shuffled).is_empty());
+        assert!(shuffled
+            .iter_old_doc_addrs()
+            .enumerate()
+            .any(
+                |(new_doc_id, addr)| base[addr.segment_ord as usize] + addr.doc_id
+                    != new_doc_id as DocId
+            ));
+
+        // The merged postings equal the plain concatenation of the source segments.
+        let merged = merge_all(&index, &segments);
+        let merged_segments = merged.searchable_segments().unwrap();
+        assert_eq!(merged_segments.len(), 1);
+        let merged_reader = SegmentReader::open(&merged_segments[0]).unwrap();
+        assert_eq!(
+            postings_by_term(&merged_reader, body),
+            expected_postings(&readers, body, &stacked)
+        );
+    }
+
+    #[test]
+    fn test_merge_stacked_with_deletes_skips_deleted_docs() {
+        let docs_per_segment: Vec<&[&str]> = vec![&["x0", "x1", "x2"], &["y0", "y1"], &["z0"]];
+        let (index, _) = build_raw_segments(&docs_per_segment);
+        let body = index.schema().get_field("body").unwrap();
+        {
+            let mut writer: crate::IndexWriter =
+                index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            writer.delete_term(Term::from_field_text(body, "x1"));
+            writer.commit().unwrap();
+        }
+        let segments = index.searchable_segments().unwrap();
+        let readers = open_readers(&segments);
+        assert!(readers.iter().any(SegmentReader::has_deletes));
+
+        // A delete forces `StackedWithDeletes`, which keeps the mapped table: the naive `max_doc`
+        // base would leave a hole where the deleted doc was, so the arithmetic path must not be
+        // used here.
+        let mapping = SegmentDocIdMapping::new(
+            concatenated_doc_addrs(&readers),
+            MappingType::StackedWithDeletes,
+            vec![None; readers.len()],
+        );
+        assert!(needs_merged_doc_id_map(MappingType::StackedWithDeletes));
+        assert!(!needs_postings_merger(MappingType::StackedWithDeletes));
+        assert!(!build_merged_doc_id_map(&readers, &mapping).is_empty());
+
+        let merged = merge_all(&index, &segments);
+        let merged_segments = merged.searchable_segments().unwrap();
+        assert_eq!(merged_segments.len(), 1);
+        let merged_reader = SegmentReader::open(&merged_segments[0]).unwrap();
+        assert_eq!(merged_reader.num_docs(), 5);
+        let got = postings_by_term(&merged_reader, body);
+
+        // The deleted doc is skipped and the survivors are packed with no hole.
+        assert_eq!(got.get("x1"), None);
+        assert_eq!(got.len(), 5);
+        let mut all_docs: Vec<DocId> = got.values().flatten().copied().collect();
+        all_docs.sort_unstable();
+        assert_eq!(all_docs, vec![0, 1, 2, 3, 4]);
+        assert_eq!(got, expected_postings(&readers, body, &mapping));
     }
 }

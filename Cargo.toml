@@ -235,6 +235,10 @@ name = "merge_segments"
 harness = false
 
 [[bench]]
+name = "merge_postings"
+harness = false
+
+[[bench]]
 name = "regex_all_terms"
 harness = false
 
