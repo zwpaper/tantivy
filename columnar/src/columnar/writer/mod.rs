@@ -145,12 +145,16 @@ impl ColumnarWriter {
     /// the `sort_values_within_row`.
     ///
     /// `sort_values_within_row` is only allowed for `Bytes` or `Str` columns.
+    ///
+    /// Returns the address of the column writer in the column's `ArenaHashMap`. That address is
+    /// stable for the lifetime of the writer and can be passed to the `record_*_at` methods to
+    /// update the column without looking it up by name again.
     pub fn record_column_type(
         &mut self,
         column_name: &str,
         column_type: ColumnType,
         sort_values_within_row: bool,
-    ) {
+    ) -> Addr {
         if sort_values_within_row {
             assert!(
                 column_type == ColumnType::Bytes || column_type == ColumnType::Str,
@@ -167,7 +171,7 @@ impl ColumnarWriter {
                     },
                     &mut self.dictionaries,
                 );
-                hash_map.mutate_or_create(
+                let (_, addr) = hash_map.mutate_or_create_addr(
                     column_name.as_bytes(),
                     |column_opt: Option<StrOrBytesColumnWriter>| {
                         let mut column_writer = if let Some(column_writer) = column_opt {
@@ -181,34 +185,45 @@ impl ColumnarWriter {
                         column_writer
                     },
                 );
+                addr
             }
             ColumnType::Bool => {
-                self.bool_field_hash_map.mutate_or_create(
-                    column_name.as_bytes(),
-                    |column_opt: Option<ColumnWriter>| column_opt.unwrap_or_default(),
-                );
+                self.bool_field_hash_map
+                    .mutate_or_create_addr(
+                        column_name.as_bytes(),
+                        |column_opt: Option<ColumnWriter>| column_opt.unwrap_or_default(),
+                    )
+                    .1
             }
             ColumnType::DateTime => {
-                self.datetime_field_hash_map.mutate_or_create(
-                    column_name.as_bytes(),
-                    |column_opt: Option<ColumnWriter>| column_opt.unwrap_or_default(),
-                );
+                self.datetime_field_hash_map
+                    .mutate_or_create_addr(
+                        column_name.as_bytes(),
+                        |column_opt: Option<ColumnWriter>| column_opt.unwrap_or_default(),
+                    )
+                    .1
             }
             ColumnType::I64 | ColumnType::F64 | ColumnType::U64 => {
                 let numerical_type = column_type.numerical_type().unwrap();
-                self.numerical_field_hash_map.mutate_or_create(
-                    column_name.as_bytes(),
-                    |column_opt: Option<NumericalColumnWriter>| {
-                        let mut column: NumericalColumnWriter = column_opt.unwrap_or_default();
-                        column.force_numerical_type(numerical_type);
-                        column
-                    },
-                );
+                self.numerical_field_hash_map
+                    .mutate_or_create_addr(
+                        column_name.as_bytes(),
+                        |column_opt: Option<NumericalColumnWriter>| {
+                            let mut column: NumericalColumnWriter = column_opt.unwrap_or_default();
+                            column.force_numerical_type(numerical_type);
+                            column
+                        },
+                    )
+                    .1
             }
-            ColumnType::IpAddr => self.ip_addr_field_hash_map.mutate_or_create(
-                column_name.as_bytes(),
-                |column_opt: Option<ColumnWriter>| column_opt.unwrap_or_default(),
-            ),
+            ColumnType::IpAddr => {
+                self.ip_addr_field_hash_map
+                    .mutate_or_create_addr(
+                        column_name.as_bytes(),
+                        |column_opt: Option<ColumnWriter>| column_opt.unwrap_or_default(),
+                    )
+                    .1
+            }
         }
     }
 
@@ -316,6 +331,81 @@ impl ColumnarWriter {
                 column
             },
         );
+    }
+
+    /// Records a numerical value into the column registered at `addr`.
+    ///
+    /// `addr` must be the address returned by [`ColumnarWriter::record_column_type`] for that
+    /// column. Unlike [`ColumnarWriter::record_numerical`], this does not look the column up by
+    /// name, so it skips the hash, the linear probe and the key comparison of the
+    /// `ArenaHashMap` on the hot path.
+    pub fn record_numerical_at<T: Into<NumericalValue> + Copy>(
+        &mut self,
+        doc: RowId,
+        addr: Addr,
+        numerical_value: T,
+    ) {
+        let (hash_map, arena) = (&mut self.numerical_field_hash_map, &mut self.arena);
+        hash_map.mutate_at(addr, |column: &mut NumericalColumnWriter| {
+            column.record_numerical_value(doc, numerical_value.into(), arena);
+        });
+    }
+
+    /// Records an IP address into the column registered at `addr` (see
+    /// [`ColumnarWriter::record_numerical_at`]).
+    pub fn record_ip_addr_at(&mut self, doc: RowId, addr: Addr, ip_addr: Ipv6Addr) {
+        let (hash_map, arena) = (&mut self.ip_addr_field_hash_map, &mut self.arena);
+        hash_map.mutate_at(addr, |column: &mut ColumnWriter| {
+            column.record(doc, ip_addr, arena);
+        });
+    }
+
+    /// Records a boolean into the column registered at `addr` (see
+    /// [`ColumnarWriter::record_numerical_at`]).
+    pub fn record_bool_at(&mut self, doc: RowId, addr: Addr, val: bool) {
+        let (hash_map, arena) = (&mut self.bool_field_hash_map, &mut self.arena);
+        hash_map.mutate_at(addr, |column: &mut ColumnWriter| {
+            column.record(doc, val, arena);
+        });
+    }
+
+    /// Records a datetime into the column registered at `addr` (see
+    /// [`ColumnarWriter::record_numerical_at`]).
+    pub fn record_datetime_at(&mut self, doc: RowId, addr: Addr, datetime: common::DateTime) {
+        let (hash_map, arena) = (&mut self.datetime_field_hash_map, &mut self.arena);
+        hash_map.mutate_at(addr, |column: &mut ColumnWriter| {
+            column.record(
+                doc,
+                NumericalValue::I64(datetime.into_timestamp_nanos()),
+                arena,
+            );
+        });
+    }
+
+    /// Records a string into the column registered at `addr` (see
+    /// [`ColumnarWriter::record_numerical_at`]).
+    pub fn record_str_at(&mut self, doc: RowId, addr: Addr, value: &str) {
+        let (hash_map, arena, dictionaries) = (
+            &mut self.str_field_hash_map,
+            &mut self.arena,
+            &mut self.dictionaries,
+        );
+        hash_map.mutate_at(addr, |column: &mut StrOrBytesColumnWriter| {
+            column.record_bytes(doc, value.as_bytes(), dictionaries, arena);
+        });
+    }
+
+    /// Records a byte string into the column registered at `addr` (see
+    /// [`ColumnarWriter::record_numerical_at`]).
+    pub fn record_bytes_at(&mut self, doc: RowId, addr: Addr, value: &[u8]) {
+        let (hash_map, arena, dictionaries) = (
+            &mut self.bytes_field_hash_map,
+            &mut self.arena,
+            &mut self.dictionaries,
+        );
+        hash_map.mutate_at(addr, |column: &mut StrOrBytesColumnWriter| {
+            column.record_bytes(doc, value, dictionaries, arena);
+        });
     }
     pub fn serialize(
         &mut self,
@@ -952,5 +1042,177 @@ mod tests {
             symbols[2],
             ColumnOperation::Value(NumericalValue::I64(17i64))
         ));
+    }
+
+    /// Byte-identity test: recording values through the cached-`Addr` path (`record_*_at`) must
+    /// produce exactly the same serialized columnar as the name-based path (`record_*`).
+    #[test]
+    fn test_record_at_matches_record_by_name() {
+        use std::net::Ipv6Addr;
+
+        use crate::DateTime;
+        use crate::columnar::column_type::ColumnType;
+
+        const NUM_DOCS: u32 = 200;
+
+        let mut by_name = super::ColumnarWriter::default();
+        let mut by_addr = super::ColumnarWriter::default();
+
+        // In the real indexer this registration happens once per fast field, in
+        // `FastFieldsWriter::from_schema_and_tokenizer_manager`.
+        by_name.record_column_type("num", ColumnType::U64, false);
+        let num_addr = by_addr.record_column_type("num", ColumnType::U64, false);
+        by_name.record_column_type("dt", ColumnType::DateTime, false);
+        let dt_addr = by_addr.record_column_type("dt", ColumnType::DateTime, false);
+        by_name.record_column_type("flag", ColumnType::Bool, false);
+        let flag_addr = by_addr.record_column_type("flag", ColumnType::Bool, false);
+        by_name.record_column_type("ip", ColumnType::IpAddr, false);
+        let ip_addr = by_addr.record_column_type("ip", ColumnType::IpAddr, false);
+        by_name.record_column_type("s", ColumnType::Str, false);
+        let s_addr = by_addr.record_column_type("s", ColumnType::Str, false);
+        by_name.record_column_type("b", ColumnType::Bytes, false);
+        let b_addr = by_addr.record_column_type("b", ColumnType::Bytes, false);
+
+        for doc in 0..NUM_DOCS {
+            let num = (doc as u64) * 7 + 3;
+            by_name.record_numerical(doc, "num", num);
+            by_addr.record_numerical_at(doc, num_addr, num);
+
+            let dt = DateTime::from_timestamp_nanos((doc as i64) * 1_000_000_007);
+            by_name.record_datetime(doc, "dt", dt);
+            by_addr.record_datetime_at(doc, dt_addr, dt);
+
+            let flag = doc % 3 == 0;
+            by_name.record_bool(doc, "flag", flag);
+            by_addr.record_bool_at(doc, flag_addr, flag);
+
+            let ip = Ipv6Addr::new(0, 0, 0, 0, 0, 0, (doc >> 8) as u16, doc as u16);
+            by_name.record_ip_addr(doc, "ip", ip);
+            by_addr.record_ip_addr_at(doc, ip_addr, ip);
+
+            let s = format!("value-{}", doc % 11);
+            by_name.record_str(doc, "s", &s);
+            by_addr.record_str_at(doc, s_addr, &s);
+
+            let b = [doc as u8, (doc >> 8) as u8];
+            by_name.record_bytes(doc, "b", &b);
+            by_addr.record_bytes_at(doc, b_addr, &b);
+
+            // A multivalued row (two values for the same doc).
+            if doc == 10 {
+                by_name.record_numerical(doc, "num", 999u64);
+                by_addr.record_numerical_at(doc, num_addr, 999u64);
+                by_name.record_str(doc, "s", "extra");
+                by_addr.record_str_at(doc, s_addr, "extra");
+            }
+        }
+
+        let mut buf_name = Vec::new();
+        by_name.serialize(NUM_DOCS, None, &mut buf_name).unwrap();
+        let mut buf_addr = Vec::new();
+        by_addr.serialize(NUM_DOCS, None, &mut buf_addr).unwrap();
+        assert_eq!(buf_name, buf_addr);
+
+        // The `_at` path really did write the values.
+        let reader = crate::ColumnarReader::open(buf_addr).unwrap();
+        let columns = reader.list_columns().unwrap();
+        let num_column: Option<crate::Column<u64>> = columns
+            .iter()
+            .find(|(name, _)| name.as_str() == "num")
+            .unwrap()
+            .1
+            .open()
+            .unwrap()
+            .into();
+        let num_column = num_column.unwrap();
+        assert_eq!(num_column.values_for_doc(0).collect::<Vec<_>>(), vec![3u64]);
+        assert_eq!(
+            num_column.values_for_doc(10).collect::<Vec<_>>(),
+            vec![73u64, 999u64]
+        );
+    }
+
+    /// Magnitude pre-check: the cached-`Addr` path must be measurably faster than the name-based
+    /// path (the plan kills the change below a 5% improvement).
+    #[test]
+    fn test_record_at_microbench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        use crate::columnar::column_type::ColumnType;
+
+        const N: u32 = 1_000_000;
+        const ROUNDS: usize = 5;
+
+        fn numerical_by_name(n: u32) -> f64 {
+            let mut writer = super::ColumnarWriter::default();
+            writer.record_column_type("num", ColumnType::U64, false);
+            let start = Instant::now();
+            for doc in 0..n {
+                writer.record_numerical(doc, "num", black_box(doc as u64));
+            }
+            start.elapsed().as_nanos() as f64 / n as f64
+        }
+        fn numerical_by_addr(n: u32) -> f64 {
+            let mut writer = super::ColumnarWriter::default();
+            let addr = writer.record_column_type("num", ColumnType::U64, false);
+            let start = Instant::now();
+            for doc in 0..n {
+                writer.record_numerical_at(doc, addr, black_box(doc as u64));
+            }
+            start.elapsed().as_nanos() as f64 / n as f64
+        }
+        fn str_by_name(n: u32) -> f64 {
+            let mut writer = super::ColumnarWriter::default();
+            writer.record_column_type("s", ColumnType::Str, false);
+            let values: Vec<String> = (0..64).map(|i| format!("value-{i}")).collect();
+            let start = Instant::now();
+            for doc in 0..n {
+                let value: &str = black_box(&values[doc as usize % values.len()]);
+                writer.record_str(doc, "s", value);
+            }
+            start.elapsed().as_nanos() as f64 / n as f64
+        }
+        fn str_by_addr(n: u32) -> f64 {
+            let mut writer = super::ColumnarWriter::default();
+            let addr = writer.record_column_type("s", ColumnType::Str, false);
+            let values: Vec<String> = (0..64).map(|i| format!("value-{i}")).collect();
+            let start = Instant::now();
+            for doc in 0..n {
+                let value: &str = black_box(&values[doc as usize % values.len()]);
+                writer.record_str_at(doc, addr, value);
+            }
+            start.elapsed().as_nanos() as f64 / n as f64
+        }
+
+        // Warm up (page cache, arena growth, branch prediction).
+        let _ = numerical_by_name(100_000);
+        let _ = numerical_by_addr(100_000);
+        let _ = str_by_name(100_000);
+        let _ = str_by_addr(100_000);
+
+        let best = |f: fn(u32) -> f64| (0..ROUNDS).map(|_| f(N)).fold(f64::MAX, f64::min);
+        let num_name = best(numerical_by_name);
+        let num_addr = best(numerical_by_addr);
+        let str_name = best(str_by_name);
+        let str_addr = best(str_by_addr);
+
+        eprintln!(
+            "microbench ns/value (best of {ROUNDS}): numerical by_name={num_name:.2} \
+             by_addr={num_addr:.2} ({:.2}x); str by_name={str_name:.2} by_addr={str_addr:.2} \
+             ({:.2}x)",
+            num_name / num_addr,
+            str_name / str_addr,
+        );
+        assert!(
+            num_addr <= num_name * 0.95,
+            "record_numerical_at is not >= 5% faster than record_numerical: {num_name:.2} -> \
+             {num_addr:.2} ns/value"
+        );
+        assert!(
+            str_addr <= str_name * 0.95,
+            "record_str_at is not >= 5% faster than record_str: {str_name:.2} -> {str_addr:.2} \
+             ns/value"
+        );
     }
 }
