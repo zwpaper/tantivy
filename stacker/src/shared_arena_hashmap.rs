@@ -301,8 +301,28 @@ impl SharedArenaHashMap {
         &mut self,
         key: &[u8],
         memory_arena: &mut MemoryArena,
-        mut updater: impl FnMut(Option<V>) -> V,
+        updater: impl FnMut(Option<V>) -> V,
     ) -> V
+    where
+        V: Copy + 'static,
+    {
+        self.mutate_or_create_addr(key, memory_arena, updater).0
+    }
+
+    /// Same as [`SharedArenaHashMap::mutate_or_create`], but also returns the address of the
+    /// value in the `memory_arena`.
+    ///
+    /// Because the memory arena is append-only, that address stays valid for the lifetime of
+    /// the value, even across a [`SharedArenaHashMap::resize`]. It can therefore be cached and
+    /// used later with [`SharedArenaHashMap::mutate_at`] to update the value without hashing or
+    /// probing the key again.
+    #[inline]
+    pub fn mutate_or_create_addr<V>(
+        &mut self,
+        key: &[u8],
+        memory_arena: &mut MemoryArena,
+        mut updater: impl FnMut(Option<V>) -> V,
+    ) -> (V, Addr)
     where
         V: Copy + 'static,
     {
@@ -331,7 +351,8 @@ impl SharedArenaHashMap {
                 }
 
                 self.set_bucket(hash, key_addr, bucket);
-                return val;
+                let val_addr = key_addr.offset(2 + key.len() as u32);
+                return (val, val_addr);
             }
             if kv.hash == hash
                 && let Some(val_addr) =
@@ -340,12 +361,31 @@ impl SharedArenaHashMap {
                 let v = memory_arena.read(val_addr);
                 let new_v = updater(Some(v));
                 memory_arena.write_at(val_addr, new_v);
-                return new_v;
+                return (new_v, val_addr);
             }
             // This allows fetching the next bucket before the loop jmp
             bucket = probe.next_probe();
             kv = self.table[bucket];
         }
+    }
+
+    /// Updates in place the value stored at `val_addr` in `memory_arena`.
+    ///
+    /// `val_addr` must have been obtained from [`SharedArenaHashMap::mutate_or_create_addr`]
+    /// (or [`SharedArenaHashMap::get_value_addr_if_key_match`]) and still be valid. This skips
+    /// the key hash, the probe and the key comparison of `mutate_or_create`.
+    #[inline]
+    pub fn mutate_at<V>(
+        &self,
+        val_addr: Addr,
+        memory_arena: &mut MemoryArena,
+        updater: impl FnOnce(&mut V),
+    ) where
+        V: Copy + 'static,
+    {
+        let mut val: V = memory_arena.read(val_addr);
+        updater(&mut val);
+        memory_arena.write_at(val_addr, val);
     }
 }
 
@@ -355,7 +395,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{SharedArenaHashMap, compute_previous_power_of_two};
-    use crate::MemoryArena;
+    use crate::{Addr, MemoryArena};
 
     #[test]
     fn test_hash_map() {
@@ -424,6 +464,45 @@ mod tests {
         assert_eq!(compute_previous_power_of_two(9), 8);
         assert_eq!(compute_previous_power_of_two(7), 4);
         assert_eq!(compute_previous_power_of_two(u64::MAX as usize), 1 << 63);
+    }
+
+    #[test]
+    fn test_mutate_or_create_addr_and_mutate_at_across_resize() {
+        let mut memory_arena = MemoryArena::default();
+        let mut hash_map: SharedArenaHashMap = SharedArenaHashMap::default();
+        // Register a handful of keys and remember their value address.
+        let mut addrs: Vec<(String, u32, Addr)> = Vec::new();
+        for i in 0..16u32 {
+            let key = format!("key-{i}");
+            let (val, addr) = hash_map.mutate_or_create_addr(
+                key.as_bytes(),
+                &mut memory_arena,
+                |opt_val: Option<u32>| {
+                    assert_eq!(opt_val, None);
+                    i
+                },
+            );
+            assert_eq!(val, i);
+            addrs.push((key, i, addr));
+        }
+        // Insert enough keys to force several resizes of the key/value table.
+        for i in 16..100_000u32 {
+            hash_map.mutate_or_create(format!("other-{i}").as_bytes(), &mut memory_arena, |_| 0u32);
+        }
+        // The cached addresses still point at the right values, and updating in place works.
+        for (key, original, addr) in &addrs {
+            let before: u32 = memory_arena.read(*addr);
+            assert_eq!(before, *original);
+            hash_map.mutate_at(*addr, &mut memory_arena, |val: &mut u32| {
+                *val += 1000;
+            });
+            let after: u32 = memory_arena.read(*addr);
+            assert_eq!(after, original + 1000);
+            assert_eq!(
+                hash_map.get::<u32>(key.as_bytes(), &memory_arena),
+                Some(after)
+            );
+        }
     }
 
     #[test]
