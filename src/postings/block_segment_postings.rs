@@ -139,6 +139,58 @@ impl BlockSegmentPostings {
         Ok(block_segment_postings)
     }
 
+    /// Resets this cursor in place to a new posting list, exactly as [`Self::open`] would build
+    /// a fresh one.
+    ///
+    /// Unlike [`Self::reset`], this reproduces `open`'s per-term handling of `record_option`:
+    /// a term whose skip data is too short for its doc frequency is decoded as
+    /// [`IndexRecordOption::Basic`] (the JSON text/numeric case), which also decides the
+    /// [`FreqReadingOption`]. Both block decoders are rebuilt, so a cursor reused across the
+    /// terms of a merge never reads the previous term's decoded frequencies.
+    pub(crate) fn reset_from_terminfo(
+        &mut self,
+        doc_freq: u32,
+        data: FileSlice,
+        mut record_option: IndexRecordOption,
+        requested_option: IndexRecordOption,
+    ) -> io::Result<()> {
+        let bytes = data.read_bytes()?;
+        let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
+        let skip_reader = match skip_data_opt {
+            Some(skip_data) => {
+                let block_count = doc_freq as usize / COMPRESSION_BLOCK_SIZE;
+                // 8 is the minimum size of a block with frequency (can be more if pos are stored
+                // too)
+                if skip_data.len() < 8 * block_count {
+                    // the field might be encoded with frequency, but this term in particular isn't.
+                    // This can happen for JSON field with term frequencies:
+                    // - text terms are encoded with term freqs.
+                    // - numerical terms are encoded without term freqs.
+                    record_option = IndexRecordOption::Basic;
+                }
+                SkipReader::new(skip_data, doc_freq, record_option)
+            }
+            None => SkipReader::new(OwnedBytes::empty(), doc_freq, record_option),
+        };
+
+        let freq_reading_option = match (record_option, requested_option) {
+            (IndexRecordOption::Basic, _) => FreqReadingOption::NoFreq,
+            (_, IndexRecordOption::Basic) => FreqReadingOption::SkipFreq,
+            (_, _) => FreqReadingOption::ReadFreq,
+        };
+
+        self.doc_decoder = BlockDecoder::with_val(TERMINATED);
+        self.block_loaded = false;
+        self.freq_decoder = BlockDecoder::with_val(1);
+        self.freq_reading_option = freq_reading_option;
+        self.block_max_score_cache = None;
+        self.doc_freq = doc_freq;
+        self.data = postings_data;
+        self.skip_reader = skip_reader;
+        self.load_block();
+        Ok(())
+    }
+
     /// Returns the block_max_score for the current block.
     /// It does not require the block to be loaded. For instance, it is ok to call this method
     /// after having called `.shallow_advance(..)`.
