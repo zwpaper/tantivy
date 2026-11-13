@@ -234,7 +234,7 @@ pub use crate::index::{
 };
 pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 pub use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
-pub use crate::schema::{Document, TantivyDocument, Term};
+pub use crate::schema::{Document, NativeDocument, TantivyDocument, Term};
 
 /// Index format version.
 pub const INDEX_FORMAT_VERSION: u32 = 7;

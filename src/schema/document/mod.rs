@@ -163,6 +163,7 @@ mod de;
 mod default_document;
 mod erased;
 mod existing_type_impls;
+mod native_document;
 mod owned_value;
 mod se;
 mod value;
@@ -179,6 +180,7 @@ pub use self::default_document::{
     CompactDocArrayIter, CompactDocObjectIter, CompactDocValue, DocParsingError, TantivyDocument,
 };
 pub use self::erased::{ErasedDocument, ErasedValue};
+pub use self::native_document::{NativeDocument, NativeDocumentIter};
 pub use self::owned_value::OwnedValue;
 pub(crate) use self::se::BinaryDocumentSerializer;
 pub use self::value::{ReferenceValue, ReferenceValueLeaf, Value};
@@ -197,19 +199,28 @@ pub trait Document: Send + Sync + 'static {
     /// Get an iterator iterating over all fields and values in a document.
     fn iter_fields_and_values(&self) -> Self::FieldsValuesIter<'_>;
 
-    /// Convert this document into the canonical [`TantivyDocument`] representation.
+    /// Materialize the canonical [`TantivyDocument`] representation, borrowing `self`.
     ///
-    /// The indexer calls this once per document so it can hand a single concrete type to
-    /// every [`PluginWriter`](crate::plugin::PluginWriter). The default materializes a new
-    /// `TantivyDocument`; `TantivyDocument` overrides it to return itself, so indexing the
-    /// default document type costs nothing extra.
-    fn into_tantivy_document(self) -> TantivyDocument
-    where Self: Sized {
+    /// The indexer calls this when a registered plugin requires the canonical concrete type
+    /// (see [`SegmentPlugin::requires_canonical_document`](crate::plugin::SegmentPlugin::requires_canonical_document))
+    /// and the document being indexed is not already a `TantivyDocument`. The default
+    /// encodes every value into a new `TantivyDocument`; a type whose values are already
+    /// canonical can override it to avoid the copy.
+    fn to_tantivy_document(&self) -> TantivyDocument {
         let mut doc = TantivyDocument::new();
         for (field, value) in self.iter_fields_and_values() {
             doc.add_field_value(field, value);
         }
         doc
+    }
+
+    /// Convert this document into the canonical [`TantivyDocument`] representation.
+    ///
+    /// The default materializes a new `TantivyDocument`; `TantivyDocument` overrides it to
+    /// return itself, so indexing the default document type costs nothing extra.
+    fn into_tantivy_document(self) -> TantivyDocument
+    where Self: Sized {
+        self.to_tantivy_document()
     }
 
     /// Sort and groups the field_values by field.

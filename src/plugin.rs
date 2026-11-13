@@ -39,6 +39,24 @@ pub trait SegmentPlugin: Send + Sync + 'static {
     /// File extensions this component manages (e.g., `["idx", "pos", "term"]` for postings).
     fn extensions(&self) -> &[&str];
 
+    /// Whether this plugin's writers require the canonical [`TantivyDocument`] concrete type.
+    ///
+    /// A plugin that recovers its input with
+    /// `doc.as_any().downcast_ref::<TantivyDocument>()` needs the document to actually *be* a
+    /// `TantivyDocument`. When any registered plugin answers `true`, the segment writer
+    /// materializes one for the plugin boundary (a no-op when the indexed document already is
+    /// a `TantivyDocument`), so such plugins keep working regardless of the caller's document
+    /// type.
+    ///
+    /// Defaults to `true` — the conservative, always-correct choice. A plugin that only walks
+    /// [`ErasedDocument::erased_fields`](crate::schema::document::ErasedDocument::erased_fields)
+    /// can override it to `false` and consume any document type without a conversion.
+    ///
+    /// [`TantivyDocument`]: crate::schema::TantivyDocument
+    fn requires_canonical_document(&self) -> bool {
+        true
+    }
+
     /// Create a writer for accumulating and serializing data during indexing.
     ///
     /// Returns a type-erased writer. The `SegmentWriter` will downcast to the concrete
@@ -363,6 +381,50 @@ mod tests {
             MARKER
         );
 
+        Ok(())
+    }
+
+    /// A plugin that needs the canonical `TantivyDocument` (the `MarkerWriter` downcasts to it)
+    /// must keep working when the indexer is fed a `NativeDocument`. The segment writer
+    /// materializes a `TantivyDocument` at the plugin boundary, preserving the plugin contract.
+    #[test]
+    fn test_plugin_keeps_working_with_native_document_input() -> crate::Result<()> {
+        use crate::schema::document::NativeDocument;
+
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let payload_field = schema_builder.add_custom_field("payload", "marker_payload", json!({}));
+        let schema = schema_builder.build();
+
+        let plugin: Arc<dyn SegmentPlugin> = Arc::new(MarkerPlugin);
+        assert!(
+            plugin.requires_canonical_document(),
+            "MarkerPlugin downcasts to TantivyDocument and must declare the canonical requirement"
+        );
+        let index = Index::builder()
+            .schema(schema)
+            .register_plugin(plugin)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter<NativeDocument> = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = NativeDocument::new();
+        doc.add_text(text_field, "hello world");
+        doc.add_custom(payload_field, b"p-native");
+        writer.add_document(doc)?;
+        writer.commit()?;
+
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.num_docs(), 1);
+        let data = searcher.segment_readers()[0]
+            .open_read(SegmentComponent::Custom("marker".to_string()))?
+            .read_bytes()?;
+        assert_eq!(parse_marker_payloads(&data), vec![b"p-native".to_vec()]);
+
+        let stored: TantivyDocument = searcher.doc(crate::DocAddress::new(0, 0))?;
+        assert_eq!(
+            stored.get_first(text_field).and_then(|v| v.as_str()),
+            Some("hello world")
+        );
         Ok(())
     }
 

@@ -4,7 +4,7 @@ use crate::fastfield::FastFieldsPluginWriter;
 use crate::index::{InvertedIndexPluginWriter, Segment};
 use crate::plugin::{PluginWriter, PluginWriterContext};
 use crate::schema::document::{Document, ErasedDocument};
-use crate::schema::Schema;
+use crate::schema::{Schema, TantivyDocument};
 use crate::store::StorePluginWriter;
 use crate::{DocId, Opstamp, TantivyError};
 
@@ -34,6 +34,12 @@ pub struct SegmentWriter {
     pub(crate) fast_fields: FastFieldsPluginWriter,
     pub(crate) store_writer: StorePluginWriter,
     custom_plugins: Vec<Box<dyn PluginWriter>>,
+    /// Whether any registered custom plugin requires the canonical [`TantivyDocument`] input.
+    ///
+    /// Computed once per segment writer from the registered plugins, so the compatibility
+    /// decision is a whole-route property and no document is converted unless a plugin needs
+    /// it. See [`SegmentPlugin::requires_canonical_document`](crate::plugin::SegmentPlugin::requires_canonical_document).
+    plugins_need_canonical_document: bool,
     pub(crate) doc_opstamps: Vec<Opstamp>,
     schema: Schema,
 }
@@ -63,6 +69,11 @@ impl SegmentWriter {
             .iter()
             .map(|plugin| plugin.create_writer(&ctx))
             .collect::<crate::Result<Vec<_>>>()?;
+        let plugins_need_canonical_document = segment
+            .index()
+            .custom_plugins()
+            .iter()
+            .any(|plugin| plugin.requires_canonical_document());
         Ok(Self {
             max_doc: 0,
             segment,
@@ -70,6 +81,7 @@ impl SegmentWriter {
             fast_fields,
             store_writer,
             custom_plugins,
+            plugins_need_canonical_document,
             doc_opstamps: Vec::with_capacity(1_000),
             schema,
         })
@@ -189,7 +201,21 @@ impl SegmentWriter {
         // Custom plugins are trait objects, so they take the document type-erased. Leaves stay
         // borrowed; a plugin that knows the concrete type recovers it for free via `as_any`.
         if !self.custom_plugins.is_empty() {
-            let erased: &dyn ErasedDocument = &document;
+            // A plugin that requires the canonical concrete type gets one. This is a whole-route
+            // decision taken once at writer construction: when no registered plugin asks for it,
+            // the caller's document is passed through untouched. When one does, we materialize a
+            // `TantivyDocument` — unless the caller already indexed one, in which case there is
+            // nothing to convert.
+            let canonical_document_opt: Option<TantivyDocument> =
+                if self.plugins_need_canonical_document && !document.as_any().is::<TantivyDocument>() {
+                    Some(document.to_tantivy_document())
+                } else {
+                    None
+                };
+            let erased: &dyn ErasedDocument = match &canonical_document_opt {
+                Some(canonical_document) => canonical_document,
+                None => &document,
+            };
             for writer in &mut self.custom_plugins {
                 writer.add_document(doc_id, erased, &self.schema)?;
             }
