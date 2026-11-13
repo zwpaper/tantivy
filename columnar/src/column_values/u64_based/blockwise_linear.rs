@@ -44,6 +44,9 @@ fn compute_num_blocks(num_vals: u32) -> u32 {
 
 pub struct BlockwiseLinearEstimator {
     block: Vec<u64>,
+    /// The line trained for each block by `flush_block_estimate`, in block order, reused by
+    /// `serialize` so that the second pass does not train a line a second time.
+    lines: Vec<Line>,
     values_num_bytes: u64,
     meta_num_bytes: u64,
 }
@@ -52,6 +55,7 @@ impl Default for BlockwiseLinearEstimator {
     fn default() -> Self {
         Self {
             block: Vec::with_capacity(BLOCK_SIZE as usize),
+            lines: Vec::new(),
             values_num_bytes: 0u64,
             meta_num_bytes: 0u64,
         }
@@ -65,6 +69,7 @@ impl BlockwiseLinearEstimator {
         }
         let column = VecColumn::from(std::mem::take(&mut self.block));
         let line = Line::train(&column);
+        self.lines.push(line);
         self.block = column.into();
 
         let mut max_value = 0u64;
@@ -116,7 +121,7 @@ impl ColumnCodecEstimator for BlockwiseLinearEstimator {
 
         let gcd_divider = DividerU64::divide_by(stats.gcd.get());
 
-        for _ in 0..num_blocks {
+        for block_idx in 0..num_blocks {
             buffer.clear();
             buffer.extend(
                 (&mut vals)
@@ -128,7 +133,12 @@ impl ColumnCodecEstimator for BlockwiseLinearEstimator {
                 *buffer_val = gcd_divider.divide(*buffer_val - stats.min_value);
             }
 
-            let line = Line::train(&VecColumn::from(buffer.to_vec()));
+            // Reuse the line already trained for this block in `flush_block_estimate`; fall back
+            // to training when the estimator was not driven through a first pass.
+            let line = match self.lines.get(block_idx) {
+                Some(&line) => line,
+                None => Line::train(&VecColumn::from(buffer.to_vec())),
+            };
 
             assert!(!buffer.is_empty());
 
@@ -280,6 +290,101 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual_compression_rate, 0.175);
+    }
+
+    /// The pre-E038 serialization: train a line on the normalized block inside `serialize`.
+    /// E038 makes `BlockwiseLinearEstimator` reuse the line trained by `flush_block_estimate`,
+    /// which is byte-identical only if the reused line equals this freshly trained one.
+    fn reference_serialized_bytes(vals: &[u64]) -> Vec<u8> {
+        use crate::column_values::u64_based::StatsCollector;
+
+        let mut stats_collector = StatsCollector::default();
+        for &val in vals {
+            stats_collector.collect(val);
+        }
+        let stats = stats_collector.stats();
+
+        let mut wrt = Vec::new();
+        stats.serialize(&mut wrt).unwrap();
+        let num_blocks = compute_num_blocks(stats.num_rows) as usize;
+        let mut blocks = Vec::with_capacity(num_blocks);
+        let mut bit_packer = BitPacker::new();
+        let gcd_divider = DividerU64::divide_by(stats.gcd.get());
+        let mut vals_iter = vals.iter().copied();
+        for _ in 0..num_blocks {
+            let mut buffer: Vec<u64> = vals_iter.by_ref().take(BLOCK_SIZE as usize).collect();
+            for buffer_val in buffer.iter_mut() {
+                *buffer_val = gcd_divider.divide(*buffer_val - stats.min_value);
+            }
+            let line = Line::train(&VecColumn::from(buffer.clone()));
+            for (i, buffer_val) in buffer.iter_mut().enumerate() {
+                *buffer_val = buffer_val.wrapping_sub(line.eval(i as u32));
+            }
+            let bit_width = buffer.iter().copied().map(compute_num_bits).max().unwrap();
+            for &buffer_val in &buffer {
+                bit_packer.write(buffer_val, bit_width, &mut wrt).unwrap();
+            }
+            blocks.push(Block {
+                line,
+                bit_unpacker: BitUnpacker::new(bit_width),
+                data_start_offset: 0,
+            });
+        }
+        bit_packer.close(&mut wrt).unwrap();
+        let mut counting_wrt = CountingWriter::wrap(&mut wrt);
+        for block in &blocks {
+            block.serialize(&mut counting_wrt).unwrap();
+        }
+        let footer_len = counting_wrt.written_bytes();
+        (footer_len as u32).serialize(&mut counting_wrt).unwrap();
+        wrt
+    }
+
+    #[test]
+    fn test_blockwise_linear_serialization_is_byte_identical() {
+        use crate::column_values::u64_based::StatsCollector;
+
+        let distributions: Vec<(Vec<u64>, &str)> = vec![
+            (
+                (0..1500u64).map(|i| 1_000_000 + i * 4).collect(),
+                "offset, gcd 4",
+            ),
+            (
+                (0..1500u64).map(|i| 1_000_000 + (i * i) % 100 * 4).collect(),
+                "irregular, gcd 4",
+            ),
+            (
+                (0..1500u64).map(|i| 500 + (i * 13) % 97).collect(),
+                "offset, gcd 1",
+            ),
+            (vec![10, 10, 10, 13], "small, gcd 3"),
+            (large_descending_jump_vals(), "descending jump"),
+        ];
+        for (vals, name) in distributions {
+            let mut estimator = BlockwiseLinearEstimator::default();
+            for &val in &vals {
+                estimator.collect(val);
+            }
+            estimator.finalize();
+            let mut stats_collector = StatsCollector::default();
+            for &val in &vals {
+                stats_collector.collect(val);
+            }
+            let stats = stats_collector.stats();
+
+            let mut got = Vec::new();
+            estimator
+                .serialize(&stats, &mut vals.iter().copied(), &mut got)
+                .unwrap();
+            let expected = reference_serialized_bytes(&vals);
+            assert_eq!(
+                got,
+                expected,
+                "serialized bytes changed for data set `{name}` ({} vs {} bytes)",
+                got.len(),
+                expected.len()
+            );
+        }
     }
 
     #[test]
