@@ -170,11 +170,14 @@ fn merge_dict_and_compute_term_ord_mapping(
         if let Some(column) = column_opt {
             term_ord_mapping.add_segment(column.dictionary.num_terms());
             let terms: Streamer<VoidSSTable> = column.dictionary.stream()?;
-            field_term_streams.push(TermsWithSegmentOrd { terms, segment_ord });
+            field_term_streams.push(TermsWithSegmentOrd {
+                terms: Box::new(terms),
+                segment_ord,
+            });
         } else {
             term_ord_mapping.add_segment(0);
             field_term_streams.push(TermsWithSegmentOrd {
-                terms: Streamer::empty(),
+                terms: Box::new(Streamer::empty()),
                 segment_ord,
             });
         }
