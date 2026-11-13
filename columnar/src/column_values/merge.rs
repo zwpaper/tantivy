@@ -1,7 +1,8 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::iterable::Iterable;
+use crate::column_values::MonotonicallyMappableToU64;
+use crate::iterable::{Iterable, append_column_values_u64};
 use crate::{ColumnIndex, ColumnValues, MergeRowOrder};
 
 pub(crate) struct MergedColumnValues<'a, T> {
@@ -52,13 +53,30 @@ impl<T: Copy + PartialOrd + Debug + 'static> Iterable<T> for MergedColumnValues<
             MergeRowOrder::Shuffled(_) => None,
         }
     }
+
+    fn extend_u64(&self, out: &mut Vec<u64>)
+    where T: MonotonicallyMappableToU64 {
+        match self.merge_row_order {
+            // Stacking yields every value of every present column, in column order: decode each
+            // present column in bulk instead of one virtual `get_val` per value.
+            MergeRowOrder::Stack(_) => {
+                for column_values in self.column_values.iter().flatten() {
+                    append_column_values_u64(column_values.as_ref(), out);
+                }
+            }
+            // Shuffled reorders (and can drop) rows; keep the boxed walk.
+            MergeRowOrder::Shuffled(_) => {
+                out.extend(self.boxed_iter().map(|value| value.to_u64()));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use common::OwnedBytes;
 
+    use super::*;
     use crate::column_values::{
         CodecType, load_u64_based_column_values, serialize_u64_based_column_values,
     };
@@ -112,7 +130,8 @@ mod tests {
         let concatenated: Vec<u64> = vals_a.iter().chain(vals_b.iter()).copied().collect();
 
         let mut merged_bytes = Vec::new();
-        serialize_u64_based_column_values(&merged_column_values, CODECS, &mut merged_bytes).unwrap();
+        serialize_u64_based_column_values(&merged_column_values, CODECS, &mut merged_bytes)
+            .unwrap();
         let mut slice_bytes = Vec::new();
         serialize_u64_based_column_values(&&concatenated[..], CODECS, &mut slice_bytes).unwrap();
 

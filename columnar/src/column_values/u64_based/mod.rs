@@ -159,10 +159,12 @@ pub fn serialize_u64_based_column_values<T: MonotonicallyMappableToU64>(
     for &codec_type in codec_types {
         estimators.push((codec_type, codec_type.estimator()));
     }
+    // Materialize the values in bulk first (the merged/dictionary sources decode a whole chunk at a
+    // time via `get_range`), then run the stats collector and the estimators over the contiguous
+    // buffer. The value sequence is the same one `boxed_iter` would yield.
     let mut values: Vec<u64> = Vec::with_capacity(vals.num_vals_hint().unwrap_or(0));
-    for val in vals.boxed_iter() {
-        let val_u64 = val.to_u64();
-        values.push(val_u64);
+    vals.extend_u64(&mut values);
+    for &val_u64 in &values {
         stats_collector.collect(val_u64);
         for (_, estimator) in &mut estimators {
             estimator.collect(val_u64);
@@ -183,8 +185,8 @@ pub fn serialize_u64_based_column_values<T: MonotonicallyMappableToU64>(
             io::Error::new(io::ErrorKind::InvalidData, "No available applicable codec.")
         })?;
     best_codec.to_code().serialize(wrt)?;
-    // The first pass already materialized the values; reuse them instead of walking (and, on the
-    // merge path, re-decoding) the source iterator a second time. The codec and the stats are
+    // `extend_u64` already materialized the values; reuse the buffer instead of walking (and, on
+    // the merge path, re-decoding) the source iterator a second time. The codec and the stats are
     // unchanged, so the serialized bytes are identical.
     best_codec_estimator.serialize(&stats, &mut values.into_iter(), wrt)?;
     Ok(())

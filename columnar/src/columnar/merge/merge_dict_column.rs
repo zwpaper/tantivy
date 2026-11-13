@@ -6,7 +6,7 @@ use sstable::{SSTable, Streamer, TermOrdinal, VoidSSTable};
 use super::term_merger::{TermMerger, TermsWithSegmentOrd};
 use crate::column::serialize_column_mappable_to_u64;
 use crate::column_index::SerializableColumnIndex;
-use crate::iterable::Iterable;
+use crate::iterable::{Iterable, append_column_values_u64};
 use crate::{BytesColumn, MergeRowOrder, ShuffleMergeOrder};
 
 // Serialize [Dictionary, Column, dictionary num bytes U32::LE]
@@ -88,9 +88,33 @@ impl Iterable for RemappedTermOrdinalsValues<'_> {
             MergeRowOrder::Shuffled(_) => None,
         }
     }
+
+    fn extend_u64(&self, out: &mut Vec<u64>) {
+        match self.merge_row_order {
+            // Stacking yields every term ordinal of every present column, in column order: decode
+            // each present ordinal column in bulk, then remap the ordinals in place.
+            MergeRowOrder::Stack(_) => self.extend_u64_stacked(out),
+            // Shuffled reorders (and can drop) rows; keep the boxed walk.
+            MergeRowOrder::Shuffled(_) => out.extend(self.boxed_iter()),
+        }
+    }
 }
 
 impl RemappedTermOrdinalsValues<'_> {
+    fn extend_u64_stacked(&self, out: &mut Vec<u64>) {
+        for (seg_ord, bytes_column_opt) in self.bytes_columns.iter().enumerate() {
+            let Some(bytes_column) = bytes_column_opt.as_ref() else {
+                continue;
+            };
+            let term_ord_after_merge_mapping = self.term_ord_mapping.get_segment(seg_ord as u32);
+            let start = out.len();
+            append_column_values_u64(bytes_column.ords().values.as_ref(), out);
+            for term_ord in &mut out[start..] {
+                *term_ord = term_ord_after_merge_mapping[*term_ord as usize];
+            }
+        }
+    }
+
     fn boxed_iter_stacked(&self) -> Box<dyn Iterator<Item = u64> + '_> {
         let iter = self
             .bytes_columns
@@ -259,5 +283,81 @@ impl TermOrdinalMapping {
 
     fn into_per_segment_new_term_ordinals(self) -> Vec<Vec<TermOrdinal>> {
         self.per_segment_new_term_ordinals
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::OwnedBytes;
+
+    use super::*;
+    use crate::column::BytesColumn;
+    use crate::column_values::{
+        CodecType, load_u64_based_column_values, serialize_u64_based_column_values,
+    };
+    use crate::columnar::{ColumnarReader, ColumnarWriter, StackMergeOrder};
+    use crate::{DynamicColumn, RowId};
+
+    const CODECS: &[CodecType] = &[CodecType::Bitpacked, CodecType::BlockwiseLinear];
+
+    fn make_str_columnar(vals: &[&str]) -> ColumnarReader {
+        let mut writer = ColumnarWriter::default();
+        for (row_id, val) in vals.iter().enumerate() {
+            writer.record_str(row_id as RowId, "texts", val);
+        }
+        let mut buffer = Vec::new();
+        writer
+            .serialize(vals.len() as RowId, None, &mut buffer)
+            .unwrap();
+        ColumnarReader::open(buffer).unwrap()
+    }
+
+    /// The stacked dictionary path decodes term ordinals in bulk and remaps them in place. The
+    /// serialized bytes must be identical to the boxed per-value walk it replaces, and the bulk
+    /// decode must yield the exact same ordinal sequence.
+    #[test]
+    fn test_serialize_remapped_term_ordinals_matches_boxed_iter() {
+        let columnar_a = make_str_columnar(&["a", "b", "a"]);
+        let columnar_b = make_str_columnar(&["c", "b"]);
+        let columnar_readers = [&columnar_a, &columnar_b];
+
+        let bytes_columns: Vec<Option<BytesColumn>> = columnar_readers
+            .iter()
+            .map(|columnar| {
+                let handle = columnar
+                    .read_columns("texts")
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .expect("column is present");
+                match handle.open().unwrap() {
+                    DynamicColumn::Str(column) => Some(column.into()),
+                    _ => panic!("expected a str column"),
+                }
+            })
+            .collect();
+        let term_ord_mapping =
+            merge_dict_and_compute_term_ord_mapping(&bytes_columns, |_| true, |_| Ok(())).unwrap();
+        let merge_row_order: MergeRowOrder = StackMergeOrder::stack(&columnar_readers[..]).into();
+        let remapped = RemappedTermOrdinalsValues {
+            bytes_columns: &bytes_columns,
+            term_ord_mapping: &term_ord_mapping,
+            merge_row_order: &merge_row_order,
+        };
+
+        let boxed_values: Vec<u64> = remapped.boxed_iter().collect();
+        let mut bulk_values = Vec::new();
+        remapped.extend_u64(&mut bulk_values);
+        assert_eq!(bulk_values, boxed_values);
+
+        let mut merged_bytes = Vec::new();
+        serialize_u64_based_column_values(&remapped, CODECS, &mut merged_bytes).unwrap();
+        let mut boxed_bytes = Vec::new();
+        serialize_u64_based_column_values(&&boxed_values[..], CODECS, &mut boxed_bytes).unwrap();
+        assert_eq!(merged_bytes, boxed_bytes);
+
+        let column = load_u64_based_column_values::<u64>(OwnedBytes::new(merged_bytes)).unwrap();
+        let read_back: Vec<u64> = (0..column.num_vals()).map(|i| column.get_val(i)).collect();
+        assert_eq!(read_back, boxed_values);
     }
 }
