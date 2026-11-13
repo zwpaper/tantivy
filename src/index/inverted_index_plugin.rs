@@ -729,18 +729,26 @@ fn write_postings_for_field(
                 for &segment_ord in &active_segment_ords {
                     let postings = &mut segment_cursors[segment_ord];
                     let base = segment_base_doc_id[segment_ord];
-                    while postings.doc() != TERMINATED {
-                        let doc = base + postings.doc();
-                        let term_freq = if has_term_freq {
+                    if has_term_freq {
+                        while postings.doc() != TERMINATED {
+                            let doc = base + postings.doc();
                             postings.positions(&mut positions_buffer);
-                            postings.term_freq()
-                        } else {
-                            positions_buffer.clear();
-                            0
-                        };
-                        let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                        field_serializer.write_doc(doc, term_freq, delta_positions);
-                        postings.advance();
+                            let term_freq = postings.term_freq();
+                            let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                            field_serializer.write_doc(doc, term_freq, delta_positions);
+                            postings.advance();
+                        }
+                    } else {
+                        // `Basic` postings carry no per-doc body, so append each already-decoded
+                        // doc-id block in bulk instead of calling `write_doc` once per doc.
+                        loop {
+                            let docs = postings.block_cursor.docs();
+                            if docs.is_empty() {
+                                break;
+                            }
+                            field_serializer.write_doc_block(docs, base);
+                            postings.block_cursor.advance();
+                        }
                     }
                 }
             }
@@ -1241,6 +1249,150 @@ mod tests {
         all_docs.sort_unstable();
         assert_eq!(all_docs, vec![0, 1, 2, 3, 4]);
         assert_eq!(got, expected_postings(&readers, body, &mapping));
+    }
+
+    /// `term -> [(doc_id, term_freq, positions)]` of a single-segment index, read with
+    /// frequencies and positions (only valid for a `WithFreqsAndPositions` field).
+    fn postings_with_positions(
+        reader: &SegmentReader,
+        field: Field,
+    ) -> BTreeMap<String, Vec<(DocId, u32, Vec<u32>)>> {
+        use crate::postings::Postings;
+        let inverted_index = reader.inverted_index(field).unwrap();
+        let mut out = BTreeMap::new();
+        let mut term_stream = inverted_index.terms().stream().unwrap();
+        while term_stream.advance() {
+            let term = String::from_utf8(term_stream.key().to_vec()).unwrap();
+            let mut postings = inverted_index
+                .read_postings(
+                    &Term::from_field_text(field, &term),
+                    IndexRecordOption::WithFreqsAndPositions,
+                )
+                .unwrap()
+                .unwrap();
+            let mut rows = Vec::new();
+            while postings.doc() != TERMINATED {
+                let mut positions = Vec::new();
+                postings.positions(&mut positions);
+                rows.push((postings.doc(), postings.term_freq(), positions));
+                postings.advance();
+            }
+            out.insert(term, rows);
+        }
+        out
+    }
+
+    /// The source postings (with frequencies and positions) remapped into merged order by the
+    /// `Stacked` affine mapping `base[s] + local`.
+    fn expected_postings_with_positions(
+        readers: &[SegmentReader],
+        field: Field,
+    ) -> BTreeMap<String, Vec<(DocId, u32, Vec<u32>)>> {
+        let base = compute_segment_base_doc_id(readers);
+        let mut out: BTreeMap<String, Vec<(DocId, u32, Vec<u32>)>> = BTreeMap::new();
+        for (segment_ord, reader) in readers.iter().enumerate() {
+            for (term, rows) in postings_with_positions(reader, field) {
+                for (local_doc, term_freq, positions) in rows {
+                    out.entry(term.clone())
+                        .or_default()
+                        .push((base[segment_ord] + local_doc, term_freq, positions));
+                }
+            }
+        }
+        for rows in out.values_mut() {
+            rows.sort_by_key(|(doc, _, _)| *doc);
+        }
+        out
+    }
+
+    /// The source postings remapped into merged order by the `Stacked` affine mapping
+    /// `base[s] + local`.
+    fn expected_postings_by_term(
+        readers: &[SegmentReader],
+        field: Field,
+    ) -> BTreeMap<String, Vec<DocId>> {
+        let base = compute_segment_base_doc_id(readers);
+        let mut out: BTreeMap<String, Vec<DocId>> = BTreeMap::new();
+        for (segment_ord, reader) in readers.iter().enumerate() {
+            for (term, docs) in postings_by_term(reader, field) {
+                for local_doc in docs {
+                    out.entry(term.clone())
+                        .or_default()
+                        .push(base[segment_ord] + local_doc);
+                }
+            }
+        }
+        for docs in out.values_mut() {
+            docs.sort_unstable();
+        }
+        out
+    }
+
+    /// A `Basic` field (bulk `write_doc_block` path) and a `WithFreqsAndPositions` field (per-doc
+    /// path) merged together, with a common term of doc frequency 180 so the 128-doc compression
+    /// block is flushed and a skip list is written. The merged postings must match the sources
+    /// exactly, positions included.
+    #[test]
+    fn test_merge_stacked_bulk_and_positions_fields() {
+        use crate::schema::document::TantivyDocument;
+
+        let mut schema_builder = Schema::builder();
+        let basic = schema_builder.add_text_field(
+            "basic",
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("raw")
+                    .set_index_option(IndexRecordOption::Basic),
+            ),
+        );
+        let body = schema_builder.add_text_field(
+            "body",
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("default")
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            ),
+        );
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for segment in 0..3u32 {
+                for doc in 0..60u32 {
+                    let mut document = TantivyDocument::new();
+                    document.add_text(basic, "common");
+                    document.add_text(basic, format!("unique_{segment}_{doc}"));
+                    document.add_text(body, "alpha beta gamma");
+                    document.add_text(body, format!("word_{segment}_{doc}"));
+                    writer.add_document(document).unwrap();
+                }
+                writer.commit().unwrap();
+            }
+        }
+        let segments = index.searchable_segments().unwrap();
+        assert_eq!(segments.len(), 3);
+        let readers = open_readers(&segments);
+
+        let merged = merge_all(&index, &segments);
+        let merged_segments = merged.searchable_segments().unwrap();
+        assert_eq!(merged_segments.len(), 1);
+        let merged_reader = SegmentReader::open(&merged_segments[0]).unwrap();
+
+        // `common` has doc frequency 180 > 128: the bulk path flushed a full block and wrote the
+        // skip list. `postings_by_term` reads with `Basic`, so it compares the doc ids only.
+        assert_eq!(
+            postings_by_term(&merged_reader, basic),
+            expected_postings_by_term(&readers, basic)
+        );
+        // The positions field keeps the per-doc path: same docs, frequencies and positions.
+        assert_eq!(
+            postings_by_term(&merged_reader, body),
+            expected_postings_by_term(&readers, body)
+        );
+        assert_eq!(
+            postings_with_positions(&merged_reader, body),
+            expected_postings_with_positions(&readers, body)
+        );
     }
 
     /// Compares two cursors doc by doc: doc ids, term frequencies and positions.
