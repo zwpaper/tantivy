@@ -139,6 +139,28 @@ impl Iterable<u32> for StackedStartOffsets<'_> {
             },
         )))
     }
+
+    fn num_vals_hint(&self) -> Option<usize> {
+        // The iterator emits the leading 0, then one start offset per document that has a value.
+        let num_start_offsets: usize = self
+            .column_indexes
+            .iter()
+            .enumerate()
+            .map(|(columnar_id, column_index)| {
+                let num_docs = self.stack_merge_order.columnar_range(columnar_id).len();
+                match column_index {
+                    ColumnIndex::Empty { .. } => 0,
+                    ColumnIndex::Full => num_docs,
+                    ColumnIndex::Optional(optional_index) => optional_index.num_non_nulls() as usize,
+                    ColumnIndex::Multivalued(multivalued_index) => {
+                        (multivalued_index.get_start_index_column().num_vals() as usize)
+                            .saturating_sub(1)
+                    }
+                }
+            })
+            .sum();
+        Some(1 + num_start_offsets)
+    }
 }
 
 fn stack_start_offsets<'a>(

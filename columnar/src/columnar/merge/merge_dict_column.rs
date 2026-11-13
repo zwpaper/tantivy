@@ -73,6 +73,21 @@ impl Iterable for RemappedTermOrdinalsValues<'_> {
             }
         }
     }
+
+    fn num_vals_hint(&self) -> Option<usize> {
+        match self.merge_row_order {
+            // Stacking yields every term ordinal of every present column, so the count is a sum.
+            MergeRowOrder::Stack(_) => Some(
+                self.bytes_columns
+                    .iter()
+                    .flatten()
+                    .map(|bytes_column| bytes_column.ords().values.num_vals() as usize)
+                    .sum(),
+            ),
+            // Shuffled can drop rows, so the count is not known without walking the order.
+            MergeRowOrder::Shuffled(_) => None,
+        }
+    }
 }
 
 impl RemappedTermOrdinalsValues<'_> {
