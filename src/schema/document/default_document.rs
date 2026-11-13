@@ -35,6 +35,10 @@ pub struct CompactDoc {
     pub(crate) node_data: Vec<u8>,
     /// The root (Field, Value) pairs
     field_values: Vec<FieldValueAddr>,
+    /// Optional grouped sidecar: one `(field, value-index range)` per field, in
+    /// ascending field-id order. Built by [`CompactDoc::seal_groups`] from a document
+    /// whose values are contiguous per field; any mutation invalidates it.
+    groups: Option<Vec<(Field, std::ops::Range<u32>)>>,
 }
 
 impl Default for CompactDoc {
@@ -50,12 +54,68 @@ impl CompactDoc {
         CompactDoc {
             node_data: Vec::with_capacity(bytes),
             field_values: Vec::with_capacity(4),
+            groups: None,
         }
     }
 
     /// Creates a new, empty document object
     pub fn new() -> CompactDoc {
         CompactDoc::with_capacity(1024)
+    }
+
+    /// Builds the grouped sidecar over the current `field_values`.
+    ///
+    /// The document's values must be contiguous per field (all values of a field added
+    /// before any value of another field), which is how the Quickwit mapper emits them.
+    /// The groups are written into a slot table indexed by field id, so the result is in
+    /// ascending field-id order with no per-document comparison sort. Returns `true` when
+    /// the document is contiguous and the sidecar was installed; returns `false` (and
+    /// leaves the sidecar absent, so consumers fall back) when a field's values are
+    /// interleaved.
+    pub fn seal_groups(&mut self) -> bool {
+        self.groups = None;
+        let num_values = self.field_values.len();
+        let Some(max_field_id) = self
+            .field_values
+            .iter()
+            .map(|field_value| field_value.field)
+            .max()
+        else {
+            // An empty document has an empty, truthful grouping.
+            self.groups = Some(Vec::new());
+            return true;
+        };
+        // One run per maximal contiguous same-field stretch. `first_run[field_id]` records
+        // the run index, so a second run for the same field is detected and rejected.
+        let mut runs: Vec<(u16, u32, u32)> = Vec::new();
+        let mut first_run: Vec<Option<u32>> = vec![None; max_field_id as usize + 1];
+        let mut i = 0usize;
+        while i < num_values {
+            let field_id = self.field_values[i].field;
+            let start = i as u32;
+            i += 1;
+            while i < num_values && self.field_values[i].field == field_id {
+                i += 1;
+            }
+            let slot = &mut first_run[field_id as usize];
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(runs.len() as u32);
+            runs.push((field_id, start, i as u32));
+        }
+        let mut groups = Vec::with_capacity(runs.len());
+        for (field_id, run_opt) in first_run.iter().enumerate() {
+            if let Some(run_idx) = run_opt {
+                let (_, start, end) = runs[*run_idx as usize];
+                groups.push((
+                    Field::from_field_id(field_id as u32),
+                    start..end,
+                ));
+            }
+        }
+        self.groups = Some(groups);
+        true
     }
 
     /// Skrinks the capacity of the document to fit the data
@@ -146,6 +206,7 @@ impl CompactDoc {
                 .expect("support only up to u16::MAX field ids"),
             value_addr: self.add_value(value),
         };
+        self.groups = None;
         self.field_values.push(field_value);
     }
 
@@ -164,6 +225,7 @@ impl CompactDoc {
                 .expect("support only up to u16::MAX field ids"),
             value_addr: self.add_value_leaf(value),
         };
+        self.groups = None;
         self.field_values.push(field_value);
     }
 
@@ -696,6 +758,16 @@ impl Document for CompactDoc {
         }
     }
 
+    fn grouped_field_ranges(&self) -> Option<&[(Field, std::ops::Range<u32>)]> {
+        self.groups.as_deref()
+    }
+
+    fn value_at(&self, index: u32) -> Option<CompactDocValue<'_>> {
+        self.field_values
+            .get(index as usize)
+            .map(|field_value| self.get_compact_doc_value(field_value.value_addr))
+    }
+
     fn into_tantivy_document(self) -> TantivyDocument {
         self
     }
@@ -746,6 +818,54 @@ impl DocParsingError {
 #[cfg(test)]
 mod tests {
     use crate::schema::*;
+
+    #[test]
+    fn test_seal_groups_orders_by_field_id_and_reports_ranges() {
+        let f0 = Field::from_field_id(0);
+        let f1 = Field::from_field_id(1);
+        let f2 = Field::from_field_id(2);
+        let mut doc = TantivyDocument::new();
+        // Added in an order that is neither field-id nor lexical.
+        doc.add_u64(f2, 1);
+        doc.add_u64(f2, 2);
+        doc.add_text(f0, "a");
+        doc.add_u64(f1, 9);
+        assert!(doc.grouped_field_ranges().is_none());
+        assert!(doc.seal_groups());
+        let groups = doc.grouped_field_ranges().unwrap();
+        assert_eq!(groups.len(), 3);
+        assert_eq!((groups[0].0, groups[0].1.clone()), (f0, 2..3));
+        assert_eq!((groups[1].0, groups[1].1.clone()), (f1, 3..4));
+        assert_eq!((groups[2].0, groups[2].1.clone()), (f2, 0..2));
+        // `value_at` addresses the same values the ranges point at.
+        assert_eq!(doc.value_at(0).unwrap().as_u64(), Some(1));
+        assert_eq!(doc.value_at(1).unwrap().as_u64(), Some(2));
+        assert_eq!(doc.value_at(2).unwrap().as_str(), Some("a"));
+        assert_eq!(doc.value_at(3).unwrap().as_u64(), Some(9));
+        assert!(doc.value_at(4).is_none());
+        // Any mutation invalidates the sidecar.
+        doc.add_u64(f0, 3);
+        assert!(doc.grouped_field_ranges().is_none());
+    }
+
+    #[test]
+    fn test_seal_groups_rejects_interleaved_fields() {
+        let f0 = Field::from_field_id(0);
+        let f1 = Field::from_field_id(1);
+        let mut doc = TantivyDocument::new();
+        doc.add_u64(f0, 1);
+        doc.add_u64(f1, 2);
+        doc.add_u64(f0, 3);
+        assert!(!doc.seal_groups());
+        assert!(doc.grouped_field_ranges().is_none());
+    }
+
+    #[test]
+    fn test_seal_groups_empty_document() {
+        let mut doc = TantivyDocument::new();
+        assert!(doc.seal_groups());
+        assert!(doc.grouped_field_ranges().unwrap().is_empty());
+    }
 
     #[test]
     fn test_doc() {

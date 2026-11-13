@@ -197,6 +197,29 @@ pub trait Document: Send + Sync + 'static {
     /// Get an iterator iterating over all fields and values in a document.
     fn iter_fields_and_values(&self) -> Self::FieldsValuesIter<'_>;
 
+    /// Optional grouped view of the document's values.
+    ///
+    /// Returns `Some` only when the document stores each field's values as a single
+    /// contiguous run, in the order the fields were added, and can expose those runs
+    /// without collecting or sorting anything. The default returns `None`, so a custom
+    /// document keeps the generic collect/sort/group path in the inverted-index plugin.
+    ///
+    /// A returned slice must be truthful: every value the document emits for a field is
+    /// inside that field's range, each field appears at most once, and the ranges partition
+    /// the document's value sequence (so [`Document::value_at`] can address them).
+    fn grouped_field_ranges(&self) -> Option<&[(Field, std::ops::Range<u32>)]> {
+        None
+    }
+
+    /// The value at `index` in the document's flat value sequence.
+    ///
+    /// Used together with [`Document::grouped_field_ranges`] to walk a range without
+    /// collecting the whole document. The default returns `None`.
+    fn value_at(&self, index: u32) -> Option<Self::Value<'_>> {
+        let _ = index;
+        None
+    }
+
     /// Convert this document into the canonical [`TantivyDocument`] representation.
     ///
     /// The indexer calls this once per document so it can hand a single concrete type to
