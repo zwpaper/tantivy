@@ -30,6 +30,10 @@ name = "bench_merge"
 harness = false
 
 [[bench]]
+name = "bench_merge_columnar_1m"
+harness = false
+
+[[bench]]
 name = "bench_access"
 harness = false
 

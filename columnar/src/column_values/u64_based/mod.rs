@@ -159,8 +159,10 @@ pub fn serialize_u64_based_column_values<T: MonotonicallyMappableToU64>(
     for &codec_type in codec_types {
         estimators.push((codec_type, codec_type.estimator()));
     }
+    let mut values: Vec<u64> = Vec::with_capacity(vals.num_vals_hint().unwrap_or(0));
     for val in vals.boxed_iter() {
         let val_u64 = val.to_u64();
+        values.push(val_u64);
         stats_collector.collect(val_u64);
         for (_, estimator) in &mut estimators {
             estimator.collect(val_u64);
@@ -181,11 +183,10 @@ pub fn serialize_u64_based_column_values<T: MonotonicallyMappableToU64>(
             io::Error::new(io::ErrorKind::InvalidData, "No available applicable codec.")
         })?;
     best_codec.to_code().serialize(wrt)?;
-    best_codec_estimator.serialize(
-        &stats,
-        &mut vals.boxed_iter().map(MonotonicallyMappableToU64::to_u64),
-        wrt,
-    )?;
+    // The first pass already materialized the values; reuse them instead of walking (and, on the
+    // merge path, re-decoding) the source iterator a second time. The codec and the stats are
+    // unchanged, so the serialized bytes are identical.
+    best_codec_estimator.serialize(&stats, &mut values.into_iter(), wrt)?;
     Ok(())
 }
 
