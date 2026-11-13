@@ -9,7 +9,7 @@ use tantivy_bitpacker::{BitPacker, BitUnpacker, compute_num_bits};
 use crate::MonotonicallyMappableToU64;
 use crate::column_values::u64_based::line::Line;
 use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
-use crate::column_values::{ColumnValues, VecColumn};
+use crate::column_values::ColumnValues;
 
 const BLOCK_SIZE: u32 = 512u32;
 
@@ -63,9 +63,7 @@ impl BlockwiseLinearEstimator {
         if self.block.is_empty() {
             return;
         }
-        let column = VecColumn::from(std::mem::take(&mut self.block));
-        let line = Line::train(&column);
-        self.block = column.into();
+        let line = Line::train_from_slice(&self.block);
 
         let mut max_value = 0u64;
         for (i, buffer_val) in self.block.iter().enumerate() {
@@ -128,16 +126,18 @@ impl ColumnCodecEstimator for BlockwiseLinearEstimator {
                 *buffer_val = gcd_divider.divide(*buffer_val - stats.min_value);
             }
 
-            let line = Line::train(&VecColumn::from(buffer.to_vec()));
+            let line = Line::train_from_slice(&buffer);
 
             assert!(!buffer.is_empty());
 
+            let mut max_value = 0u64;
             for (i, buffer_val) in buffer.iter_mut().enumerate() {
                 let interpolated_val = line.eval(i as u32);
                 *buffer_val = buffer_val.wrapping_sub(interpolated_val);
+                max_value = max_value.max(*buffer_val);
             }
 
-            let bit_width = buffer.iter().copied().map(compute_num_bits).max().unwrap();
+            let bit_width = compute_num_bits(max_value);
 
             for &buffer_val in &buffer {
                 bit_packer.write(buffer_val, bit_width, wrt)?;
@@ -250,6 +250,122 @@ mod tests {
             .map(|i| high_start + i)
             .chain(0u64..256)
             .collect()
+    }
+
+    /// The pre-E040 `serialize` body, kept verbatim as the byte-identity
+    /// reference: it trains the `Line` through `VecColumn` and computes the bit
+    /// width in a separate pass.
+    fn reference_serialize_old(vals: &[u64]) -> Vec<u8> {
+        use crate::column_values::u64_based::StatsCollector;
+
+        let mut stats_collector = StatsCollector::default();
+        for &val in vals {
+            stats_collector.collect(val);
+        }
+        let stats = stats_collector.stats();
+
+        let mut wrt = Vec::new();
+        stats.serialize(&mut wrt).unwrap();
+        let mut buffer = Vec::with_capacity(BLOCK_SIZE as usize);
+        let num_blocks = compute_num_blocks(stats.num_rows) as usize;
+        let mut blocks = Vec::with_capacity(num_blocks);
+
+        let mut bit_packer = BitPacker::new();
+        let gcd_divider = DividerU64::divide_by(stats.gcd.get());
+        let mut vals_iter = vals.iter().copied();
+
+        for _ in 0..num_blocks {
+            buffer.clear();
+            buffer.extend(
+                (&mut vals_iter)
+                    .map(MonotonicallyMappableToU64::to_u64)
+                    .take(BLOCK_SIZE as usize),
+            );
+            for buffer_val in buffer.iter_mut() {
+                *buffer_val = gcd_divider.divide(*buffer_val - stats.min_value);
+            }
+            let line = Line::train(&crate::column_values::VecColumn::from(buffer.to_vec()));
+            assert!(!buffer.is_empty());
+            for (i, buffer_val) in buffer.iter_mut().enumerate() {
+                let interpolated_val = line.eval(i as u32);
+                *buffer_val = buffer_val.wrapping_sub(interpolated_val);
+            }
+            let bit_width = buffer.iter().copied().map(compute_num_bits).max().unwrap();
+            for &buffer_val in &buffer {
+                bit_packer.write(buffer_val, bit_width, &mut wrt).unwrap();
+            }
+            blocks.push(Block {
+                line,
+                bit_unpacker: BitUnpacker::new(bit_width),
+                data_start_offset: 0,
+            });
+        }
+
+        bit_packer.close(&mut wrt).unwrap();
+        let mut counting_wrt = CountingWriter::wrap(&mut wrt);
+        for block in &blocks {
+            block.serialize(&mut counting_wrt).unwrap();
+        }
+        let footer_len = counting_wrt.written_bytes();
+        (footer_len as u32).serialize(&mut counting_wrt).unwrap();
+        drop(counting_wrt);
+        wrt
+    }
+
+    /// The codec's `serialize` output must stay byte-identical to the pre-change
+    /// algorithm for every value distribution the codec is expected to handle.
+    #[test]
+    fn test_blockwise_linear_serialization_is_byte_identical() {
+        use crate::column_values::u64_based::StatsCollector;
+
+        // A tiny deterministic PRNG, so the "random" case is reproducible.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let distributions: Vec<(Vec<u64>, &str)> = vec![
+            (vec![11, 20, 40, 20, 10, 10, 10, 10, 10, 10], "simple"),
+            (vec![10, 20, 40, 20, 10, 10, 10, 10, 10, 10], "gcd > 1"),
+            (
+                (0..1500u64).map(|i| 1_000_000 + i * 3).collect(),
+                "min != 0",
+            ),
+            ((0..1500).map(|_| next() % 100_000).collect(), "random"),
+            ((0..1500u64).rev().collect(), "descending"),
+            (large_descending_jump_vals(), "large descending jump"),
+        ];
+
+        for (vals, name) in distributions {
+            let mut estimator = BlockwiseLinearEstimator::default();
+            for &val in &vals {
+                estimator.collect(val);
+            }
+            estimator.finalize();
+
+            let mut stats_collector = StatsCollector::default();
+            for &val in &vals {
+                stats_collector.collect(val);
+            }
+            let stats = stats_collector.stats();
+
+            let mut got = Vec::new();
+            estimator
+                .serialize(&stats, &mut vals.iter().copied(), &mut got)
+                .unwrap();
+            let expected = reference_serialize_old(&vals);
+            assert!(!got.is_empty(), "serialize produced no bytes for `{name}`");
+            assert_eq!(
+                got,
+                expected,
+                "serialized bytes changed for data set `{name}` ({} vs {} bytes)",
+                got.len(),
+                expected.len()
+            );
+        }
     }
 
     #[test]

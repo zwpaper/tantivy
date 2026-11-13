@@ -142,6 +142,23 @@ impl Line {
             ys.iter().enumerate().map(|(pos, val)| (pos as u64, val)),
         )
     }
+
+    /// Same contract as [`Line::train`], but reads the values from a contiguous
+    /// slice instead of a `dyn ColumnValues`.
+    ///
+    /// This is the exact same computation as [`Line::train`] (the slice is
+    /// visited in the same order), without the boxed iterator or the
+    /// `VecColumn` copy/min-max pass that building one implies.
+    pub fn train_from_slice(ys: &[u64]) -> Self {
+        let first_val = ys[0];
+        let last_val = ys[ys.len() - 1];
+        Self::train_from(
+            first_val,
+            last_val,
+            ys.len() as u32,
+            ys.iter().enumerate().map(|(pos, &val)| (pos as u64, val)),
+        )
+    }
 }
 
 impl BinarySerializable for Line {
@@ -205,5 +222,49 @@ mod tests {
         test_line_interpol_with_translation(&data, Some(0));
         let data: Vec<u64> = (0..255).map(|el| el * 2).collect();
         test_line_interpol_with_translation(&data, Some(0));
+    }
+
+    /// `train_from_slice` must produce the exact same line (and hence the exact
+    /// same serialized bytes) as the `dyn ColumnValues` path it replaces in
+    /// `BlockwiseLinearEstimator`.
+    #[test]
+    fn test_train_from_slice_matches_train() {
+        // A tiny deterministic PRNG, so the "random" case is reproducible.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let high_start: u64 = 4_294_967_039; // ≈ 2^32 - 257
+        let datasets: Vec<(Vec<u64>, &str)> = vec![
+            (vec![11, 20, 40, 20, 10, 10, 10, 10, 10, 10], "simple"),
+            (vec![10, 20, 40, 20, 10, 10, 10, 10, 10, 10], "gcd"),
+            (
+                (0..600u64).map(|i| 1_000_000 + i * 3).collect(),
+                "min != 0",
+            ),
+            ((0..600).map(|_| next()).collect(), "random"),
+            ((0..600u64).rev().collect(), "descending"),
+            (
+                (0u64..256)
+                    .map(|i| high_start + i)
+                    .chain(0u64..256)
+                    .collect(),
+                "large descending jump",
+            ),
+        ];
+
+        for (ys, name) in datasets {
+            let from_slice = Line::train_from_slice(&ys);
+            let from_column = Line::train(&VecColumn::from(ys.clone()));
+            assert_eq!(from_slice.slope, from_column.slope, "{name}: slope");
+            assert_eq!(
+                from_slice.intercept, from_column.intercept,
+                "{name}: intercept"
+            );
+        }
     }
 }
