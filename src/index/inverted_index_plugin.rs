@@ -201,27 +201,50 @@ impl InvertedIndexPluginWriter {
         doc_id: DocId,
         doc: &D,
     ) -> crate::Result<()> {
-        let vals_grouped_by_field = doc
-            .iter_fields_and_values()
-            .sorted_by_key(|(field, _)| *field)
-            .chunk_by(|(field, _)| *field);
-
-        for (field, field_values) in &vals_grouped_by_field {
-            let values = field_values.map(|el| el.1);
-
-            let field_entry = self.schema.get_field_entry(field);
-            let make_schema_error = || {
-                TantivyError::SchemaError(format!(
-                    "Expected a {:?} for field {:?}",
-                    field_entry.field_type().value_type(),
-                    field_entry.name()
-                ))
-            };
-            if !field_entry.is_indexed() {
-                continue;
+        if let Some(groups) = doc.grouped_field_ranges() {
+            // The document already stores each field's values as one contiguous run, so
+            // there is nothing to collect, sort or group.
+            for (field, range) in groups {
+                let values = range.clone().filter_map(|index| doc.value_at(index));
+                self.index_field_values(doc_id, *field, values)?;
             }
+        } else {
+            let vals_grouped_by_field = doc
+                .iter_fields_and_values()
+                .sorted_by_key(|(field, _)| *field)
+                .chunk_by(|(field, _)| *field);
 
-            let (term_buffer, ctx) = (&mut self.term_buffer, &mut self.ctx);
+            for (field, field_values) in &vals_grouped_by_field {
+                self.index_field_values(doc_id, field, field_values.map(|el| el.1))?;
+            }
+        }
+        self.max_doc = doc_id + 1;
+        Ok(())
+    }
+
+    /// Tokenizes and indexes one field's values for one document.
+    ///
+    /// Shared by the generic collect/sort/group path and the pre-grouped path; `values`
+    /// yields the field's values in document order.
+    fn index_field_values<'a, V: Value<'a>, I: Iterator<Item = V>>(
+        &mut self,
+        doc_id: DocId,
+        field: Field,
+        values: I,
+    ) -> crate::Result<()> {
+        let field_entry = self.schema.get_field_entry(field);
+        let make_schema_error = || {
+            TantivyError::SchemaError(format!(
+                "Expected a {:?} for field {:?}",
+                field_entry.field_type().value_type(),
+                field_entry.name()
+            ))
+        };
+        if !field_entry.is_indexed() {
+            return Ok(());
+        }
+
+        let (term_buffer, ctx) = (&mut self.term_buffer, &mut self.ctx);
             let postings_writer: &mut dyn PostingsWriter =
                 self.per_field_postings_writers.get_for_field_mut(field);
             term_buffer.clear_with_field(field);
@@ -396,8 +419,6 @@ impl InvertedIndexPluginWriter {
                     unreachable!("the inverted index does not support this field type")
                 }
             }
-        }
-        self.max_doc = doc_id + 1;
         Ok(())
     }
 }
@@ -861,6 +882,156 @@ mod tests {
             }
         }
         expected
+    }
+
+    #[test]
+    fn test_grouped_document_indexes_identically() {
+        use crate::schema::{document::TantivyDocument, FAST, INDEXED};
+
+        // Builds a one-segment index of the same documents, optionally installing the
+        // grouped sidecar before each `add_document`. The values are added in an order that
+        // is neither field-id nor lexical, and `body` is multivalued.
+        fn build(seal: bool) -> (Index, Field, Field) {
+            let mut schema_builder = Schema::builder();
+            let body = schema_builder.add_text_field(
+                "body",
+                TextOptions::default().set_indexing_options(
+                    TextFieldIndexing::default()
+                        .set_tokenizer("default")
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                ),
+            );
+            let num = schema_builder.add_u64_field("num", INDEXED | FAST);
+            let index = Index::create_in_ram(schema_builder.build());
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for i in 0..3u64 {
+                let mut doc = TantivyDocument::new();
+                doc.add_u64(num, i);
+                doc.add_text(body, format!("alpha beta{i}"));
+                doc.add_text(body, "gamma");
+                if seal {
+                    assert!(doc.seal_groups());
+                }
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().unwrap();
+            (index, body, num)
+        }
+
+        let (grouped, grouped_body, grouped_num) = build(true);
+        let (generic, generic_body, generic_num) = build(false);
+        assert_eq!(grouped_body, generic_body);
+        assert_eq!(grouped_num, generic_num);
+
+        let grouped_segments = grouped.searchable_segments().unwrap();
+        let generic_segments = generic.searchable_segments().unwrap();
+        assert_eq!(grouped_segments.len(), 1);
+        assert_eq!(generic_segments.len(), 1);
+        let grouped_reader = SegmentReader::open(&grouped_segments[0]).unwrap();
+        let generic_reader = SegmentReader::open(&generic_segments[0]).unwrap();
+        assert_eq!(grouped_reader.num_docs(), generic_reader.num_docs());
+
+        // Term dictionaries and postings are identical for both the text and the numeric field.
+        for (field, reader_a, reader_b) in [
+            (grouped_body, &grouped_reader, &generic_reader),
+            (grouped_num, &grouped_reader, &generic_reader),
+        ] {
+            assert_eq!(
+                postings_by_term(reader_a, field),
+                postings_by_term(reader_b, field)
+            );
+        }
+
+        // Field norms (token counts) are identical.
+        let grouped_norms = grouped_reader.get_fieldnorms_reader(grouped_body).unwrap();
+        let generic_norms = generic_reader.get_fieldnorms_reader(generic_body).unwrap();
+        for doc in 0..grouped_reader.num_docs() {
+            assert_eq!(
+                grouped_norms.fieldnorm_id(doc),
+                generic_norms.fieldnorm_id(doc)
+            );
+        }
+    }
+
+    /// Micro-bench for the pre-check: the grouping pass the plugin runs per document,
+    /// legacy (collect + sort + lazy group) versus the pre-grouped sidecar. Run with
+    /// `cargo test --release --lib test_grouped_grouping_microbench -- --nocapture`.
+    #[test]
+    fn test_grouped_grouping_microbench() {
+        use std::time::Instant;
+
+        use itertools::Itertools;
+
+        use crate::schema::document::{Document, Value};
+        use crate::schema::{document::TantivyDocument, FAST, INDEXED, TEXT};
+
+        // ~100 fields, like the ClickBench schema.
+        let mut schema_builder = Schema::builder();
+        let text_fields: Vec<Field> = (0..50)
+            .map(|i| schema_builder.add_text_field(&format!("t{i:03}"), TEXT))
+            .collect();
+        let num_fields: Vec<Field> = (0..50)
+            .map(|i| schema_builder.add_u64_field(&format!("n{i:03}"), INDEXED | FAST))
+            .collect();
+
+        let make_doc = |seal: bool| {
+            let mut doc = TantivyDocument::new();
+            // Deliberately added in an order that is neither field-id nor lexical.
+            for (i, field) in num_fields.iter().enumerate().rev() {
+                doc.add_u64(*field, i as u64);
+            }
+            for (i, field) in text_fields.iter().enumerate().rev() {
+                doc.add_text(*field, format!("value{i}"));
+            }
+            if seal {
+                assert!(doc.seal_groups());
+            }
+            doc
+        };
+        let grouped_doc = make_doc(true);
+        let generic_doc = make_doc(false);
+
+        let iters = 200_000u64;
+        let time = |doc: &TantivyDocument, grouped: bool| {
+            let start = Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..iters {
+                if grouped {
+                    for (field, range) in doc.grouped_field_ranges().unwrap() {
+                        for index in range.clone() {
+                            let value = doc.value_at(index).unwrap();
+                            sink += field.field_id() as usize
+                                + value.as_u64().unwrap_or(0) as usize
+                                + value.as_str().map_or(0, str::len);
+                        }
+                    }
+                } else {
+                    let groups = doc
+                        .iter_fields_and_values()
+                        .sorted_by_key(|(field, _)| *field)
+                        .chunk_by(|(field, _)| *field);
+                    for (field, values) in &groups {
+                        for value in values.map(|el| el.1) {
+                            sink += field.field_id() as usize
+                                + value.as_u64().unwrap_or(0) as usize
+                                + value.as_str().map_or(0, str::len);
+                        }
+                    }
+                }
+            }
+            std::hint::black_box(sink);
+            start.elapsed().as_secs_f64() / iters as f64
+        };
+        let generic_s = time(&generic_doc, false);
+        let grouped_s = time(&grouped_doc, true);
+        println!(
+            "grouping microbench: legacy {:.1} ns/doc, grouped {:.1} ns/doc, dI {:.1} s/100M",
+            generic_s * 1e9,
+            grouped_s * 1e9,
+            (generic_s - grouped_s) * 1e8
+        );
+        assert!(grouped_s < generic_s);
     }
 
     /// One in-RAM segment per entry of `docs_per_segment`, one raw indexed text field.
