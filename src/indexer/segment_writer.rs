@@ -207,7 +207,9 @@ impl SegmentWriter {
             // `TantivyDocument` — unless the caller already indexed one, in which case there is
             // nothing to convert.
             let canonical_document_opt: Option<TantivyDocument> =
-                if self.plugins_need_canonical_document && !document.as_any().is::<TantivyDocument>() {
+                if self.plugins_need_canonical_document
+                    && !document.as_any().is::<TantivyDocument>()
+                {
                     Some(document.to_tantivy_document())
                 } else {
                     None
