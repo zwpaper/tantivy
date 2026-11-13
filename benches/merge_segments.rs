@@ -21,7 +21,7 @@ use tantivy::directory::{
     WritePtr,
 };
 use tantivy::indexer::{merge_filtered_segments, NoMergePolicy};
-use tantivy::schema::{Schema, FAST, TEXT};
+use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, TEXT};
 use tantivy::{doc, HasLen, Index, IndexSettings, IndexSortByField, Order, Segment};
 
 #[global_allocator]
@@ -152,8 +152,47 @@ fn build_index(
     tokens_per_doc: usize,
     vocab_size: usize,
 ) -> MergeScenario {
+    build_index_with_options(
+        num_segments,
+        docs_per_segment,
+        tokens_per_doc,
+        vocab_size,
+        TEXT,
+    )
+}
+
+/// Like [`build_index`], but the text field records only doc ids (`IndexRecordOption::Basic`),
+/// the option every ClickBench field uses: no frequencies, no positions. This exercises the
+/// bulk `PostingsSerializer::write_doc_block` merge path.
+fn build_basic_index(
+    num_segments: usize,
+    docs_per_segment: usize,
+    tokens_per_doc: usize,
+    vocab_size: usize,
+) -> MergeScenario {
+    let basic_text = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("default")
+            .set_index_option(IndexRecordOption::Basic),
+    );
+    build_index_with_options(
+        num_segments,
+        docs_per_segment,
+        tokens_per_doc,
+        vocab_size,
+        basic_text,
+    )
+}
+
+fn build_index_with_options(
+    num_segments: usize,
+    docs_per_segment: usize,
+    tokens_per_doc: usize,
+    vocab_size: usize,
+    text_options: TextOptions,
+) -> MergeScenario {
     let mut schema_builder = Schema::builder();
-    let body = schema_builder.add_text_field("body", TEXT);
+    let body = schema_builder.add_text_field("body", text_options);
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema.clone());
 
@@ -293,10 +332,21 @@ fn main() {
         build_index(8, 50_000, 8, 8 * 50_000 * 8),
     ];
 
+    let basic_scenarios = vec![
+        build_basic_index(8, 50_000, 12, 8),
+        build_basic_index(16, 50_000, 12, 8),
+        build_basic_index(16, 100_000, 12, 8),
+        build_basic_index(8, 50_000, 8, 8 * 50_000 * 8),
+    ];
+
     let mut runner = BenchRunner::new();
     runner.add_plugin(PeakMemAllocPlugin::new(GLOBAL));
     for scenario in scenarios {
         let name = format!("merge_segments inv_index — {}", scenario.label);
+        bench_merge(&mut runner, name, scenario);
+    }
+    for scenario in basic_scenarios {
+        let name = format!("merge_segments basic inv_index — {}", scenario.label);
         bench_merge(&mut runner, name, scenario);
     }
 

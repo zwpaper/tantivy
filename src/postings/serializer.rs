@@ -216,6 +216,19 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
         }
     }
 
+    /// Serializes a whole block of documents containing the current term, in bulk.
+    ///
+    /// `docs` are local document ids, shifted by `doc_offset`. This is the bulk equivalent
+    /// of calling [`Self::write_doc`] once per document with a term frequency and positions
+    /// that are ignored; it is only valid for fields that record neither term frequencies
+    /// nor positions (the `Basic` record option, the ClickBench case), where the per-posting
+    /// body is empty.
+    pub fn write_doc_block(&mut self, docs: &[DocId], doc_offset: DocId) {
+        debug_assert!(self.positions_serializer_opt.is_none());
+        self.current_term_info.doc_freq += docs.len() as u32;
+        self.postings_serializer.write_doc_block(docs, doc_offset);
+    }
+
     /// Finish the serialization for this term postings.
     ///
     /// If the current block is incomplete, it needs to be encoded
@@ -439,6 +452,30 @@ impl PostingsSerializer {
         }
     }
 
+    /// Register that each document of `docs` contains the current term, in bulk.
+    ///
+    /// The local document ids are shifted by `doc_offset` (the affine `Stacked` merge mapping)
+    /// before being appended. This is the bulk equivalent of calling [`Self::write_doc`] once
+    /// per document with an (ignored) term frequency of `0`: it fills and flushes the same
+    /// `COMPRESSION_BLOCK_SIZE`-sized blocks, so the serialized postings are byte-identical.
+    pub fn write_doc_block(&mut self, docs: &[DocId], doc_offset: DocId) {
+        let mut remaining = docs;
+        while !remaining.is_empty() {
+            let free = COMPRESSION_BLOCK_SIZE - self.block.len;
+            let take = free.min(remaining.len());
+            let dst = self.block.len..self.block.len + take;
+            for (out, &doc) in self.block.doc_ids[dst.clone()].iter_mut().zip(&remaining[..take]) {
+                *out = doc_offset + doc;
+            }
+            self.block.term_freqs[dst].fill(0);
+            self.block.len += take;
+            if self.block.is_full() {
+                self.write_block();
+            }
+            remaining = &remaining[take..];
+        }
+    }
+
     /// Finish the serialization for this term.
     pub fn close_term(
         &mut self,
@@ -482,5 +519,56 @@ impl PostingsSerializer {
     fn clear(&mut self) {
         self.block.clear();
         self.last_doc_id_encoded = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PostingsSerializer;
+    use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
+    use crate::schema::IndexRecordOption;
+    use crate::DocId;
+
+    /// Serializes one `Basic` term by calling [`PostingsSerializer::write_doc`] once per doc,
+    /// the reference the bulk path must reproduce.
+    fn serialize_per_doc(docs: &[DocId], doc_offset: DocId) -> Vec<u8> {
+        let mut serializer = PostingsSerializer::new(0.0, IndexRecordOption::Basic, None);
+        serializer.new_term(docs.len() as u32, false);
+        for &doc in docs {
+            serializer.write_doc(doc_offset + doc, 0);
+        }
+        let mut out = Vec::new();
+        serializer.close_term(docs.len() as u32, &mut out).unwrap();
+        out
+    }
+
+    /// Serializes the same term through [`PostingsSerializer::write_doc_block`], handing it the
+    /// docs in the `COMPRESSION_BLOCK_SIZE`-sized chunks a decoded source block would provide.
+    fn serialize_blocks(docs: &[DocId], doc_offset: DocId) -> Vec<u8> {
+        let mut serializer = PostingsSerializer::new(0.0, IndexRecordOption::Basic, None);
+        serializer.new_term(docs.len() as u32, false);
+        for block in docs.chunks(COMPRESSION_BLOCK_SIZE) {
+            serializer.write_doc_block(block, doc_offset);
+        }
+        let mut out = Vec::new();
+        serializer.close_term(docs.len() as u32, &mut out).unwrap();
+        out
+    }
+
+    /// The bulk path must serialize exactly the bytes the per-doc path does, around the
+    /// `COMPRESSION_BLOCK_SIZE` boundary (the skip list appears at `doc_freq >= 128`) and with
+    /// the affine `Stacked` doc offset applied.
+    #[test]
+    fn test_write_doc_block_matches_write_doc() {
+        for num_docs in [0usize, 1, 127, 128, 129, 256, 300, 1025] {
+            let docs: Vec<DocId> = (0..num_docs as DocId).map(|i| i * 3).collect();
+            for doc_offset in [0, 1, 1000] {
+                assert_eq!(
+                    serialize_blocks(&docs, doc_offset),
+                    serialize_per_doc(&docs, doc_offset),
+                    "num_docs={num_docs} doc_offset={doc_offset}"
+                );
+            }
+        }
     }
 }
