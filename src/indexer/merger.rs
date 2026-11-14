@@ -506,6 +506,13 @@ impl IndexMerger {
     /// Each plugin's [`SegmentPlugin::merge`] opens and closes its own serializers,
     /// so the merge path drives no incremental plugin writers.
     ///
+    /// Plugins run in write order (matching `Index::all_plugins`): inverted index, then
+    /// fast fields, store, and custom plugins. `InvertedIndexPlugin` (fieldnorm/term/idx/pos)
+    /// and `FastFieldsPlugin` (fast) write disjoint component files from immutable inputs, so
+    /// those two run concurrently on the merge pool via [`rayon::join`]; the store and custom
+    /// plugins stay sequential after them. On a single-threaded merge pool the join degenerates
+    /// to the previous sequential execution.
+    ///
     /// # Returns
     /// The number of documents in the resulting segment.
     pub fn write(&self, target_segment: &Segment) -> crate::Result<u32> {
@@ -520,20 +527,31 @@ impl IndexMerger {
             self.get_doc_id_from_concatenated_data()?
         };
 
-        // Merge plugins in write order (matching `Index::all_plugins`):
-        // inverted index, then fast_fields, store, and custom plugins.
-        for plugin in builtin_plugins()
-            .into_iter()
-            .chain(self.custom_plugins.iter().cloned())
-        {
+        let plugins = builtin_plugins();
+        let merge_ctx = || PluginMergeContext {
+            readers: &self.readers,
+            doc_id_mapping: &doc_id_mapping,
+            target_segment,
+            schema: &self.schema,
+            settings: &self.index_settings,
+        };
+
+        let (inverted_index_res, fast_fields_res) = rayon::join(
+            || {
+                debug!("merge-plugin: {:?}", plugins[0].extensions());
+                plugins[0].merge(merge_ctx())
+            },
+            || {
+                debug!("merge-plugin: {:?}", plugins[1].extensions());
+                plugins[1].merge(merge_ctx())
+            },
+        );
+        inverted_index_res?;
+        fast_fields_res?;
+
+        for plugin in plugins[2..].iter().chain(self.custom_plugins.iter()) {
             debug!("merge-plugin: {:?}", plugin.extensions());
-            plugin.merge(PluginMergeContext {
-                readers: &self.readers,
-                doc_id_mapping: &doc_id_mapping,
-                target_segment,
-                schema: &self.schema,
-                settings: &self.index_settings,
-            })?;
+            plugin.merge(merge_ctx())?;
         }
 
         Ok(self.max_doc)
@@ -1611,6 +1629,232 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// Merges `segments` with [`merge_filtered_segments`] inside a rayon pool of `num_threads`
+    /// threads, so [`IndexMerger::write`]'s `rayon::join` of the inverted-index and fast-field
+    /// merges runs sequentially (1 thread) or overlapped (more than 1).
+    fn merge_on_pool(
+        segments: &[crate::Segment],
+        settings: &IndexSettings,
+        num_threads: usize,
+    ) -> Index {
+        use crate::directory::RamDirectory;
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            crate::indexer::merge_filtered_segments(
+                segments,
+                settings.clone(),
+                vec![None; segments.len()],
+                RamDirectory::create(),
+            )
+            .unwrap()
+        })
+    }
+
+    /// The raw bytes of one component file of a segment.
+    fn component_bytes(
+        segment: &crate::Segment,
+        component: crate::index::SegmentComponent,
+    ) -> Vec<u8> {
+        segment
+            .open_read(component)
+            .unwrap()
+            .read_bytes()
+            .unwrap()
+            .as_slice()
+            .to_vec()
+    }
+
+    /// E048 pre-check: overlapping `InvertedIndexPlugin` and `FastFieldsPlugin` on the merge pool
+    /// must not change a single output byte, because the two plugins write disjoint component
+    /// files (`.fieldnorm/.term/.idx/.pos` vs `.fast`) from immutable inputs.
+    #[test]
+    fn test_merge_plugin_overlap_is_byte_identical() {
+        use crate::index::SegmentComponent;
+        use crate::schema::{STORED, STRING};
+
+        let mut schema_builder = schema::Schema::builder();
+        let body = schema_builder.add_text_field(
+            "body",
+            schema::TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("default")
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            ),
+        );
+        let tag = schema_builder.add_text_field(
+            "tag",
+            schema::TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("raw")
+                    .set_index_option(IndexRecordOption::Basic),
+            ),
+        );
+        let num = schema_builder.add_u64_field("num", INDEXED | FAST);
+        let cat = schema_builder.add_text_field("cat", STRING);
+        let stored = schema_builder.add_text_field("stored", STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for segment in 0..3u64 {
+                for doc in 0..300u64 {
+                    let mut document = TantivyDocument::new();
+                    document.add_text(body, "alpha beta gamma");
+                    document.add_text(body, format!("word_{segment}_{doc}"));
+                    document.add_text(tag, format!("tag{}", doc % 7));
+                    document.add_u64(num, doc);
+                    document.add_text(cat, format!("cat{}", doc % 5));
+                    document.add_text(stored, format!("payload {segment} {doc}"));
+                    writer.add_document(document).unwrap();
+                }
+                writer.commit().unwrap();
+            }
+        }
+        let segments = index.searchable_segments().unwrap();
+        assert_eq!(segments.len(), 3);
+
+        let sequential = merge_on_pool(&segments, index.settings(), 1);
+        let overlapped = merge_on_pool(&segments, index.settings(), 4);
+
+        let sequential_segment = sequential.searchable_segments().unwrap().remove(0);
+        let overlapped_segment = overlapped.searchable_segments().unwrap().remove(0);
+        for (component, name) in [
+            (SegmentComponent::FastFields, "fast"),
+            (SegmentComponent::FieldNorms, "fieldnorm"),
+            (SegmentComponent::Terms, "term"),
+            (SegmentComponent::Postings, "idx"),
+            (SegmentComponent::Positions, "pos"),
+            (SegmentComponent::Store, "store"),
+        ] {
+            assert_eq!(
+                component_bytes(&sequential_segment, component.clone()),
+                component_bytes(&overlapped_segment, component),
+                "merged component .{name} differs between the sequential and overlapped merge"
+            );
+        }
+
+        // The merged answers agree too: same doc count, same counts for a few queries.
+        let sequential_searcher = sequential.reader().unwrap().searcher();
+        let overlapped_searcher = overlapped.reader().unwrap().searcher();
+        assert_eq!(
+            sequential_searcher.num_docs(),
+            overlapped_searcher.num_docs()
+        );
+        let count = |searcher: &Searcher, query: &dyn crate::query::Query| {
+            searcher.search(query, &Count).unwrap()
+        };
+        assert_eq!(
+            count(&sequential_searcher, &AllQuery),
+            count(&overlapped_searcher, &AllQuery)
+        );
+        for (field, term) in [(body, "alpha"), (body, "gamma"), (tag, "tag3")] {
+            let query =
+                TermQuery::new(Term::from_field_text(field, term), IndexRecordOption::Basic);
+            assert_eq!(
+                count(&sequential_searcher, &query),
+                count(&overlapped_searcher, &query)
+            );
+        }
+    }
+
+    /// E048 pre-check micro-bench: the overlapped merge must beat the sequential one on wall time.
+    /// Builds 8 segments of 131,072 docs with a ClickBench-shaped schema (~50 numeric indexed+fast,
+    /// ~20 raw-text indexed+fast, 2 datetime indexed+fast — the fast-field and postings merges are
+    /// both substantial) and times [`IndexMerger::write`] on a 4-thread pool against the sequential
+    /// (1-thread pool) path; requires a >= 1.3x speedup (best of 2 each). Ignored by default: run
+    /// explicitly with
+    /// `cargo test --release --lib test_merge_plugin_overlap_microbench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "E048 pre-check microbench: run explicitly with --ignored --nocapture"]
+    fn test_merge_plugin_overlap_microbench() {
+        use std::time::Instant;
+
+        let mut schema_builder = schema::Schema::builder();
+        let num_fields: Vec<_> = (0..50)
+            .map(|i| schema_builder.add_i64_field(&format!("num{i:02}"), INDEXED | FAST))
+            .collect();
+        let text_fields: Vec<_> = (0..20)
+            .map(|i| {
+                schema_builder.add_text_field(
+                    &format!("txt{i:02}"),
+                    schema::TextOptions::default()
+                        .set_indexing_options(
+                            TextFieldIndexing::default()
+                                .set_tokenizer("raw")
+                                .set_index_option(IndexRecordOption::Basic),
+                        )
+                        .set_fast("raw"),
+                )
+            })
+            .collect();
+        let date_fields: Vec<_> = (0..2)
+            .map(|i| schema_builder.add_date_field(&format!("dt{i}"), INDEXED | FAST))
+            .collect();
+        let index = Index::create_in_ram(schema_builder.build());
+        let docs_per_segment = 131_072u64;
+        {
+            let mut writer = index.writer_with_num_threads(1, 256_000_000).unwrap();
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for _segment in 0..8u64 {
+                for doc in 0..docs_per_segment {
+                    let mut document = TantivyDocument::new();
+                    // High-cardinality values (unique per doc, like ClickBench's WatchID / URLHash
+                    // / timestamps), so both the postings and the columnar merges carry real work.
+                    let row = _segment * docs_per_segment + doc;
+                    for (i, field) in num_fields.iter().enumerate() {
+                        document
+                            .add_i64(*field, (row as i64).wrapping_mul(31).wrapping_add(i as i64));
+                    }
+                    for (i, field) in text_fields.iter().enumerate() {
+                        document.add_text(*field, format!("v{i}_{_segment}_{doc}"));
+                    }
+                    for (i, field) in date_fields.iter().enumerate() {
+                        document
+                            .add_date(*field, DateTime::from_timestamp_secs(row as i64 + i as i64));
+                    }
+                    writer.add_document(document).unwrap();
+                }
+                writer.commit().unwrap();
+            }
+        }
+        let segments = index.searchable_segments().unwrap();
+        assert!(segments.len() >= 8, "expected >= 8 segments");
+        let merger =
+            super::IndexMerger::open(index.schema(), index.settings().clone(), &segments).unwrap();
+
+        let time = |num_threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .build()
+                .unwrap();
+            let mut best = f64::MAX;
+            for _ in 0..2 {
+                let target_index = Index::create_in_ram(index.schema());
+                let target_segment = target_index.new_segment();
+                let start = Instant::now();
+                pool.install(|| merger.write(&target_segment)).unwrap();
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best
+        };
+
+        let sequential = time(1);
+        let overlapped = time(4);
+        let speedup = sequential / overlapped;
+        println!(
+            "merge plugin overlap microbench: sequential {sequential:.3}s, overlapped \
+             {overlapped:.3}s, speedup {speedup:.2}x"
+        );
+        assert!(
+            speedup >= 1.3,
+            "overlap speedup {speedup:.2}x < 1.3x: the plugin merges do not overlap"
+        );
     }
 
     #[test]
