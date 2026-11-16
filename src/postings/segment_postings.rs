@@ -151,6 +151,17 @@ impl SegmentPostings {
             position_reader,
         }
     }
+
+    /// Resets this cursor to the start of a posting list whose block cursor has already been
+    /// reset in place.
+    ///
+    /// This is the in-place sibling of [`Self::from_block_postings`]: `position_reader` is the
+    /// reader of the new term (or `None` when the requested option has no positions), replacing
+    /// the previous term's reader.
+    pub(crate) fn reset_positions(&mut self, position_reader: Option<PositionReader>) {
+        self.cur = 0;
+        self.position_reader = position_reader;
+    }
 }
 
 impl DocSet for SegmentPostings {

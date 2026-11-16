@@ -274,6 +274,43 @@ impl InvertedIndexReader {
         ))
     }
 
+    /// Resets `segment_postings` in place to the posting list of `term_info`.
+    ///
+    /// This is the in-place sibling of [`Self::read_postings_from_terminfo`]: it yields the same
+    /// cursor, but reuses an already-allocated [`SegmentPostings`] instead of building and moving
+    /// a fresh one. Merging a term therefore resets one cursor per source segment rather than
+    /// pushing a ~1.9 KB cursor into, and draining it out of, a per-term `Vec`.
+    ///
+    /// This method is for an advanced usage only.
+    pub fn read_postings_from_terminfo_into(
+        &self,
+        term_info: &TermInfo,
+        option: IndexRecordOption,
+        segment_postings: &mut SegmentPostings,
+    ) -> io::Result<()> {
+        let option = option.downgrade(self.record_option);
+
+        let postings_data = self
+            .postings_file_slice
+            .slice(term_info.postings_range.clone());
+        segment_postings.block_cursor.reset_from_terminfo(
+            term_info.doc_freq,
+            postings_data,
+            self.record_option,
+            option,
+        )?;
+        let position_reader = if option.has_positions() {
+            let positions_data = self
+                .positions_file_slice
+                .read_bytes_slice(term_info.positions_range.clone())?;
+            Some(PositionReader::open(positions_data)?)
+        } else {
+            None
+        };
+        segment_postings.reset_positions(position_reader);
+        Ok(())
+    }
+
     /// Returns the total number of tokens recorded for all documents
     /// (including deleted documents).
     pub fn total_num_tokens(&self) -> u64 {

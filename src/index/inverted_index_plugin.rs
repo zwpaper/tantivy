@@ -656,12 +656,18 @@ fn write_postings_for_field(
                      indexed. Have you modified the schema?",
     );
 
-    let mut segment_postings_containing_the_term: Vec<(usize, SegmentPostings)> = vec![];
+    // One reusable cursor per source segment, allocated once per field. A term resets the
+    // cursors of its active segments in place instead of building a fresh `SegmentPostings`
+    // per (term, segment) and moving it in and out of a per-term `Vec`.
+    let mut segment_cursors: Vec<SegmentPostings> = (0..readers.len())
+        .map(|_| SegmentPostings::empty())
+        .collect();
+    let mut active_segment_ords: Vec<usize> = Vec::new();
     let mut merger =
         needs_postings_merger(mapping_type).then(|| PostingsMerger::new(&merged_doc_id_map));
 
     while merged_terms.advance() {
-        segment_postings_containing_the_term.clear();
+        active_segment_ords.clear();
         let term_bytes: &[u8] = merged_terms.key();
 
         let mut total_doc_freq = 0;
@@ -669,8 +675,12 @@ fn write_postings_for_field(
         for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
             let segment_reader = &readers[segment_ord];
             let inverted_index: &InvertedIndexReader = &field_readers[segment_ord];
-            let segment_postings =
-                inverted_index.read_postings_from_terminfo(&term_info, segment_postings_option)?;
+            let segment_postings = &mut segment_cursors[segment_ord];
+            inverted_index.read_postings_from_terminfo_into(
+                &term_info,
+                segment_postings_option,
+                segment_postings,
+            )?;
             let alive_bitset_opt = segment_reader.alive_bitset();
             let doc_freq = if let Some(alive_bitset) = alive_bitset_opt {
                 segment_postings.doc_freq_given_deletes(alive_bitset)
@@ -679,7 +689,7 @@ fn write_postings_for_field(
             };
             if doc_freq > 0u32 {
                 total_doc_freq += doc_freq;
-                segment_postings_containing_the_term.push((segment_ord, segment_postings));
+                active_segment_ords.push(segment_ord);
             }
         }
 
@@ -687,16 +697,20 @@ fn write_postings_for_field(
             continue;
         }
 
-        assert!(!segment_postings_containing_the_term.is_empty());
+        assert!(!active_segment_ords.is_empty());
 
         let has_term_freq = {
-            let has_term_freq = !segment_postings_containing_the_term[0]
-                .1
+            let has_term_freq = !segment_cursors[active_segment_ords[0]]
                 .block_cursor
                 .freqs()
                 .is_empty();
-            for (_, postings) in &segment_postings_containing_the_term[1..] {
-                if has_term_freq == postings.block_cursor.freqs().is_empty() {
+            for &segment_ord in &active_segment_ords[1..] {
+                if has_term_freq
+                    == segment_cursors[segment_ord]
+                        .block_cursor
+                        .freqs()
+                        .is_empty()
+                {
                     return Err(DataCorruption::comment_only(
                         "Term freqs are inconsistent across segments",
                     )
@@ -712,7 +726,8 @@ fn write_postings_for_field(
             MappingType::Stacked => {
                 // Delete-free stacked merge: the mapping is affine (`base[s] + local`), so remap
                 // arithmetically instead of loading an `Option<DocId>` table per posting.
-                for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
+                for &segment_ord in &active_segment_ords {
+                    let postings = &mut segment_cursors[segment_ord];
                     let base = segment_base_doc_id[segment_ord];
                     while postings.doc() != TERMINATED {
                         let doc = base + postings.doc();
@@ -731,9 +746,10 @@ fn write_postings_for_field(
             }
             MappingType::StackedWithDeletes => {
                 // Deleted docs must still be skipped, so this keeps the mapped table.
-                for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
+                for &segment_ord in &active_segment_ords {
+                    let postings = &mut segment_cursors[segment_ord];
                     let mapping = &merged_doc_id_map[segment_ord];
-                    while let Some(doc) = crate::postings::next_mapped_doc(&mut postings, mapping) {
+                    while let Some(doc) = crate::postings::next_mapped_doc(postings, mapping) {
                         let term_freq = if has_term_freq {
                             postings.positions(&mut positions_buffer);
                             postings.term_freq()
@@ -751,7 +767,13 @@ fn write_postings_for_field(
                 let merger = merger
                     .as_mut()
                     .expect("Shuffled doc-id mapping needs a PostingsMerger");
-                merger.reset(segment_postings_containing_the_term.drain(..));
+                // Not the merge hot path: `PostingsMerger` takes its cursors by value, so hand it
+                // copies rather than the reusable per-segment cursors.
+                merger.reset(
+                    active_segment_ords
+                        .iter()
+                        .map(|&segment_ord| (segment_ord, segment_cursors[segment_ord].clone())),
+                );
                 while merger.advance() {
                     let term_freq = if has_term_freq {
                         merger.positions(&mut positions_buffer);
@@ -811,6 +833,7 @@ mod tests {
     use crate::index::SegmentReader;
     use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
     use crate::indexer::{merge_filtered_segments, NoMergePolicy};
+    use crate::postings::SegmentPostings;
     use crate::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
     use crate::{DocAddress, DocId, Index, Segment, Term};
 
@@ -1218,5 +1241,99 @@ mod tests {
         all_docs.sort_unstable();
         assert_eq!(all_docs, vec![0, 1, 2, 3, 4]);
         assert_eq!(got, expected_postings(&readers, body, &mapping));
+    }
+
+    /// Compares two cursors doc by doc: doc ids, term frequencies and positions.
+    ///
+    /// Positions are only compared when the term carries frequencies: a JSON numeric term has
+    /// none (the reader downgrades it to `Basic`), and `Postings::positions` must not be called
+    /// on such a term.
+    fn assert_same_postings(mut left: SegmentPostings, mut right: SegmentPostings) {
+        use crate::postings::Postings;
+        loop {
+            assert_eq!(left.doc(), right.doc());
+            if left.doc() == TERMINATED {
+                break;
+            }
+            assert_eq!(left.term_freq(), right.term_freq());
+            assert_eq!(
+                left.block_cursor.freqs().is_empty(),
+                right.block_cursor.freqs().is_empty()
+            );
+            if !left.block_cursor.freqs().is_empty() {
+                let mut left_positions = Vec::new();
+                let mut right_positions = Vec::new();
+                left.positions(&mut left_positions);
+                right.positions(&mut right_positions);
+                assert_eq!(left_positions, right_positions);
+            }
+            left.advance();
+            right.advance();
+        }
+    }
+
+    /// The in-place `read_postings_from_terminfo_into` must produce exactly the cursor the owned
+    /// `read_postings_from_terminfo` builds, for every term of a text field (positions), a numeric
+    /// field (no frequencies) and a JSON field (mixed text/numeric terms, where `open` downgrades
+    /// `record_option` to `Basic` per term). One cursor is reused across all terms, as the merge
+    /// does per segment.
+    #[test]
+    fn test_read_postings_from_terminfo_into_matches_owned() -> crate::Result<()> {
+        use crate::schema::document::TantivyDocument;
+        use crate::schema::{OwnedValue, INDEXED, TEXT};
+
+        let mut schema_builder = Schema::builder();
+        let body = schema_builder.add_text_field(
+            "body",
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("default")
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            ),
+        );
+        let num = schema_builder.add_u64_field("num", INDEXED);
+        let json = schema_builder.add_json_field("json", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        // More than one compression block for the common terms, so the skip list and the
+        // bitpacked frequency/position decoders are exercised, plus short lists for the rest.
+        for i in 0..300u64 {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(body, "alpha beta gamma");
+            doc.add_text(body, format!("word{i}"));
+            doc.add_u64(num, i % 7);
+            let object: BTreeMap<String, OwnedValue> =
+                serde_json::from_str(r#"{"text":"delta","number":1,"nested":{"s":"epsilon"}}"#)
+                    .unwrap();
+            doc.add_object(json, object);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+
+        let searcher = index.reader()?.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let schema = index.schema();
+        for field in [body, num, json] {
+            let inverted_index = segment_reader.inverted_index(field)?;
+            let option = schema
+                .get_field_entry(field)
+                .field_type()
+                .get_index_record_option()
+                .expect("indexed field");
+            let mut cursor = SegmentPostings::empty();
+            let mut term_stream = inverted_index.terms().stream()?;
+            let mut num_terms = 0usize;
+            while term_stream.advance() {
+                let term_info = term_stream.value().clone();
+                let owned = inverted_index.read_postings_from_terminfo(&term_info, option)?;
+                inverted_index.read_postings_from_terminfo_into(&term_info, option, &mut cursor)?;
+                assert_same_postings(owned, cursor.clone());
+                num_terms += 1;
+            }
+            assert!(num_terms > 0, "field {field:?} has no indexed terms");
+        }
+        Ok(())
     }
 }
