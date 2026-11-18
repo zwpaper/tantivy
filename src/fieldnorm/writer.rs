@@ -44,6 +44,7 @@ impl FieldNormsWriter {
                 Ok("1")
             )
         });
+        log::info!("e054-fieldnorm-capacity-cache enabled={cache}");
         Self::for_schema_with_cache(schema, cache)
     }
 
