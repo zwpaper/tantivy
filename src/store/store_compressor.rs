@@ -166,7 +166,8 @@ enum BlockCompressorMessage {
 
 struct DedicatedThreadBlockCompressorImpl {
     join_handle: Option<JoinHandle<io::Result<()>>>,
-    tx: SyncSender<BlockCompressorMessage>,
+    // Disconnect before joining, including early errors and unwinding.
+    tx: Option<SyncSender<BlockCompressorMessage>>,
 }
 
 impl DedicatedThreadBlockCompressorImpl {
@@ -197,7 +198,7 @@ impl DedicatedThreadBlockCompressorImpl {
             })?;
         Ok(DedicatedThreadBlockCompressorImpl {
             join_handle: Some(join_handle),
-            tx,
+            tx: Some(tx),
         })
     }
 
@@ -213,16 +214,36 @@ impl DedicatedThreadBlockCompressorImpl {
     }
 
     fn send(&mut self, msg: BlockCompressorMessage) -> io::Result<()> {
-        if self.tx.send(msg).is_err() {
+        if self
+            .tx
+            .as_ref()
+            .expect("compressor sender is open")
+            .send(msg)
+            .is_err()
+        {
             harvest_thread_result(self.join_handle.take())?;
             return Err(io::Error::other("Unidentified error."));
         }
         Ok(())
     }
 
-    fn close(self) -> io::Result<()> {
-        drop(self.tx);
-        harvest_thread_result(self.join_handle)
+    fn close(mut self) -> io::Result<()> {
+        // The worker receives until disconnect; joining while retaining tx would deadlock.
+        self.tx.take();
+        harvest_thread_result(self.join_handle.take())
+    }
+}
+
+impl Drop for DedicatedThreadBlockCompressorImpl {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(join_handle) = self.join_handle.take() {
+            // A failed/unwinding finalizer must not leave its compressor using the directory.
+            // Drop cannot return an error (or panic during unwinding); explicit close still does.
+            if let Err(error) = harvest_thread_result(Some(join_handle)) {
+                log::warn!("error draining abandoned docstore compressor: {error}");
+            }
+        }
     }
 }
 
@@ -252,6 +273,108 @@ mod tests {
         block_compressor.compress_block_and_write(b"happy", 1)?;
         block_compressor.close()?;
         Ok(())
+    }
+
+    fn drain_fixture(
+        result: io::Result<()>,
+        finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> super::DedicatedThreadBlockCompressorImpl {
+        let (tx, rx) = std::sync::mpsc::sync_channel(3);
+        let handle = std::thread::spawn(move || {
+            // Completion requires sender disconnect, not a timing-dependent sleep.
+            while rx.recv().is_ok() {}
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            result
+        });
+        super::DedicatedThreadBlockCompressorImpl {
+            join_handle: Some(handle),
+            tx: Some(tx),
+        }
+    }
+
+    #[test]
+    fn test_e052_drop_disconnects_and_joins() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        drop(drain_fixture(Ok(()), finished.clone()));
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_e052_unwind_drains_before_returning() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = finished.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _compressor = drain_fixture(Ok(()), observed);
+            panic!("injected finalization unwind");
+        });
+        assert!(result.is_err());
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_e052_close_returns_worker_error() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let error = drain_fixture(
+            Err(io::Error::other("injected writer error")),
+            finished.clone(),
+        )
+        .close()
+        .unwrap_err();
+        assert!(error.to_string().contains("injected writer error"));
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_e052_drop_does_not_replace_unwind_with_worker_panic() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(3);
+        let handle = std::thread::spawn(move || -> io::Result<()> {
+            let _ = rx.recv();
+            panic!("injected compressor panic");
+        });
+        let compressor = super::DedicatedThreadBlockCompressorImpl {
+            join_handle: Some(handle),
+            tx: Some(tx),
+        };
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(compressor)))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_e052_early_drop_matches_explicit_close_bytes() {
+        let directory = RamDirectory::default();
+        let mut dropped = BlockCompressor::new(
+            Compressor::None,
+            directory.open_write(Path::new("dropped")).unwrap(),
+            true,
+        )
+        .unwrap();
+        let mut closed = BlockCompressor::new(
+            Compressor::None,
+            directory.open_write(Path::new("closed")).unwrap(),
+            true,
+        )
+        .unwrap();
+        for compressor in [&mut dropped, &mut closed] {
+            compressor
+                .compress_block_and_write(b"same bytes", 1)
+                .unwrap();
+        }
+        closed.close().unwrap();
+        drop(dropped);
+        assert_eq!(
+            directory
+                .open_read(Path::new("dropped"))
+                .unwrap()
+                .read_bytes()
+                .unwrap(),
+            directory
+                .open_read(Path::new("closed"))
+                .unwrap()
+                .read_bytes()
+                .unwrap(),
+        );
     }
 
     #[test]
