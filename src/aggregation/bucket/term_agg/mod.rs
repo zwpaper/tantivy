@@ -9,6 +9,7 @@ use columnar::{
 use common::{BitSet, TinySet};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use super::{BucketIdSlot, CustomOrder, Order, OrderTarget};
 use crate::aggregation::agg_data::{
@@ -24,6 +25,7 @@ use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
     IntermediateKey, IntermediateTermBucketEntry, IntermediateTermBucketResult,
 };
+use crate::aggregation::paged_vec::PagedVec;
 use crate::aggregation::segment_agg_result::{BucketIdProvider, SegmentAggregationCollector};
 use crate::aggregation::{format_date, BucketId, Key, ValueSource};
 use crate::error::DataCorruption;
@@ -466,7 +468,7 @@ pub(crate) fn build_segment_term_collector(
             let term_buckets = VecTermBuckets::<BucketId>::new(num_terms, &mut bucket_id_provider);
             add_memory_consumption(&term_buckets, req_data)?;
             let collector: SegmentTermCollector<_, LowCardSubAggBuffer> = SegmentTermCollector {
-                parent_buckets: vec![term_buckets],
+                parent_buckets: PagedVec::singleton(term_buckets),
                 sub_agg: sub_agg_collector.map(LowCardBufferedSubAggs::new),
                 bucket_id_provider,
                 max_term_id: max_column_val,
@@ -552,23 +554,49 @@ pub(crate) fn build_segment_term_collector(
             ))
         }
     } else if has_sub_aggregations {
-        let term_buckets = HashMapTermBuckets::<BucketId>::default();
-        Ok(boxed_high_card_collector(
-            term_buckets,
-            sub_agg,
-            bucket_id_provider,
-            max_column_val,
-            terms_req_data,
-        ))
+        // High cardinality. A top-level map holds the segment's whole term dictionary, which is
+        // never created once per parent bucket, so it keeps the plain hash map. A non-top-level
+        // map may be created once per parent bucket; when the parent is a near-unique id column
+        // each of those maps holds a single term, so keep the first terms inline.
+        if is_top_level {
+            let term_buckets = HashMapTermBuckets::<BucketId>::default();
+            Ok(boxed_high_card_collector(
+                term_buckets,
+                sub_agg,
+                bucket_id_provider,
+                max_column_val,
+                terms_req_data,
+            ))
+        } else {
+            let term_buckets = SmallTermBuckets::<BucketId>::default();
+            Ok(boxed_high_card_collector(
+                term_buckets,
+                sub_agg,
+                bucket_id_provider,
+                max_column_val,
+                terms_req_data,
+            ))
+        }
     } else {
-        let term_buckets = HashMapTermBuckets::<()>::default();
-        Ok(boxed_high_card_collector(
-            term_buckets,
-            sub_agg,
-            bucket_id_provider,
-            max_column_val,
-            terms_req_data,
-        ))
+        if is_top_level {
+            let term_buckets = HashMapTermBuckets::<()>::default();
+            Ok(boxed_high_card_collector(
+                term_buckets,
+                sub_agg,
+                bucket_id_provider,
+                max_column_val,
+                terms_req_data,
+            ))
+        } else {
+            let term_buckets = SmallTermBuckets::<()>::default();
+            Ok(boxed_high_card_collector(
+                term_buckets,
+                sub_agg,
+                bucket_id_provider,
+                max_column_val,
+                terms_req_data,
+            ))
+        }
     }
 }
 
@@ -582,7 +610,7 @@ fn boxed_high_card_collector<M: TermAggregationMap>(
     terms_req_data: TermsAggReqData,
 ) -> Box<dyn SegmentAggregationCollector> {
     Box::new(SegmentTermCollector::<M, HighCardSubAggBuffer> {
-        parent_buckets: vec![term_buckets],
+        parent_buckets: PagedVec::singleton(term_buckets),
         sub_agg,
         bucket_id_provider,
         max_term_id,
@@ -839,6 +867,113 @@ impl<K: AggregationMapKey, B: BucketIdSlot> TermAggregationMap<K> for HashMapTer
     }
 }
 
+/// Number of terms a [`SmallTermBuckets`] map holds inline before it promotes to a hash map.
+///
+/// A nested terms aggregation creates one map per parent bucket. When the parent has high
+/// cardinality (a near-unique id column, say), each of those maps holds a single term, and an
+/// `FxHashMap` allocates a table on its first insert: one allocation per parent bucket, 6.25M per
+/// split for ClickBench q33. Two inline slots cover that shape without touching the allocator.
+const SMALL_TERM_MAP_INLINE: usize = 2;
+
+/// A term map for buckets that hold only a handful of terms: entries live inline, and the map
+/// promotes to [`HashMapTermBuckets`]' storage once it grows past `SMALL_TERM_MAP_INLINE`, so a
+/// wide bucket costs what it did before.
+///
+/// The inline scan is linear, which is why the promotion threshold is small: past a couple of
+/// entries a hash lookup wins even for a map this size.
+#[derive(Clone, Debug)]
+pub(crate) struct SmallTermBuckets<B = BucketId, K = u64> {
+    repr: SmallTermBucketsRepr<B, K>,
+}
+
+#[derive(Clone, Debug)]
+enum SmallTermBucketsRepr<B, K> {
+    Inline(SmallVec<[(K, Bucket<B>); SMALL_TERM_MAP_INLINE]>),
+    Map(FxHashMap<K, Bucket<B>>),
+}
+
+impl<B, K> Default for SmallTermBuckets<B, K> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            repr: SmallTermBucketsRepr::Inline(SmallVec::new()),
+        }
+    }
+}
+
+impl<K: AggregationMapKey, B: BucketIdSlot> TermAggregationMap<K> for SmallTermBuckets<B, K> {
+    type Slot = B;
+
+    const SORTED_BY_KEY: bool = false;
+
+    #[inline]
+    fn get_memory_consumption(&self) -> usize {
+        match &self.repr {
+            SmallTermBucketsRepr::Inline(entries) => {
+                entries.capacity() * std::mem::size_of::<(K, Bucket<B>)>()
+            }
+            SmallTermBucketsRepr::Map(map) => map.memory_consumption(),
+        }
+    }
+
+    #[inline]
+    fn term_entry(&mut self, key: K, bucket_id_provider: &mut BucketIdProvider) -> B {
+        if let SmallTermBucketsRepr::Inline(entries) = &mut self.repr {
+            for (entry_key, bucket) in entries.iter_mut() {
+                if *entry_key == key {
+                    bucket.count += 1;
+                    return bucket.bucket_id;
+                }
+            }
+            if entries.len() < SMALL_TERM_MAP_INLINE {
+                let mut bucket = Bucket::<B>::new(bucket_id_provider);
+                bucket.count = 1;
+                entries.push((key, bucket));
+                return bucket.bucket_id;
+            }
+        }
+        // Either the inline slots are full (promote first) or the map is already a hash map.
+        if matches!(self.repr, SmallTermBucketsRepr::Inline(_)) {
+            let repr = std::mem::replace(
+                &mut self.repr,
+                SmallTermBucketsRepr::Map(FxHashMap::default()),
+            );
+            let SmallTermBucketsRepr::Inline(entries) = repr else {
+                unreachable!("checked above");
+            };
+            let mut map = FxHashMap::default();
+            map.reserve(2 * SMALL_TERM_MAP_INLINE);
+            for (entry_key, bucket) in entries {
+                map.insert(entry_key, bucket);
+            }
+            self.repr = SmallTermBucketsRepr::Map(map);
+        }
+        let SmallTermBucketsRepr::Map(map) = &mut self.repr else {
+            unreachable!("promoted above");
+        };
+        let bucket = match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Bucket::new(bucket_id_provider))
+            }
+        };
+        bucket.count += 1;
+        bucket.bucket_id
+    }
+
+    fn into_vec(self) -> Vec<(K, Bucket<B>)> {
+        match self.repr {
+            SmallTermBucketsRepr::Inline(entries) => entries.into_vec(),
+            SmallTermBucketsRepr::Map(map) => map.into_iter().collect(),
+        }
+    }
+
+    #[inline]
+    fn new(_map_init_value: u64, _bucket_id_provider: &mut BucketIdProvider) -> Self {
+        Self::default()
+    }
+}
+
 /// Number of independent counters maintained per logical very-low-cardinality term bucket.
 ///
 /// Cycling writes across eight counters covers the read/modify/write latency of a counter update
@@ -1005,8 +1140,12 @@ impl<B: BucketIdSlot> TermAggregationMap for LazyVecTermBuckets<B> {
 /// the correct datatype.
 #[derive(Debug)]
 struct SegmentTermCollector<TermMap: TermAggregationMap, B: SubAggBuffer> {
-    /// The buckets containing the aggregation data.
-    parent_buckets: Vec<TermMap>,
+    /// The buckets containing the aggregation data, indexed by [`BucketId`].
+    ///
+    /// Paged because a nested term agg grows this one `TermMap` per parent bucket (up to the
+    /// parent's bucket count); a plain `Vec` reallocates (and copies) the whole buffer on the way
+    /// there.
+    parent_buckets: PagedVec<TermMap, 8>,
     sub_agg: Option<BufferedSubAggs<B>>,
     bucket_id_provider: BucketIdProvider,
     max_term_id: u64,
