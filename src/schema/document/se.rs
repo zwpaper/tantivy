@@ -4,6 +4,7 @@ use std::io::Write;
 
 use columnar::MonotonicallyMappableToU128;
 use common::{f64_to_u64, BinarySerializable, VInt};
+use smallvec::SmallVec;
 
 use super::{OwnedValue, ReferenceValueLeaf};
 use crate::schema::document::{type_codes, Document, ReferenceValue, Value};
@@ -143,9 +144,10 @@ where W: Write
             ReferenceValue::Array(elements) => {
                 self.write_type_code(type_codes::ARRAY_CODE)?;
 
-                // Somewhat unfortunate that we do this here however, writing the
-                // length at the end of the complicates things quite considerably.
-                let elements: Vec<V> = elements.collect();
+                // The length has to be written before the entries, so the elements have to be
+                // buffered. `_dynamic` / JSON arrays are small, so an inline buffer avoids the
+                // per-array heap allocation; larger arrays still spill to the heap.
+                let elements: SmallVec<[V; 8]> = elements.collect();
 
                 let mut serializer = BinaryArraySerializer::begin(elements.len(), self.writer)?;
 
@@ -158,9 +160,10 @@ where W: Write
             ReferenceValue::Object(object) => {
                 self.write_type_code(type_codes::OBJECT_CODE)?;
 
-                // Somewhat unfortunate that we do this here however, writing the
-                // length at the end of the complicates things quite considerably.
-                let entries: Vec<(&str, V)> = object.collect();
+                // The length has to be written before the entries, so the entries have to be
+                // buffered. `_dynamic` / JSON objects are small, so an inline buffer avoids the
+                // per-object heap allocation; larger objects still spill to the heap.
+                let entries: SmallVec<[(&str, V); 8]> = object.collect();
 
                 let mut serializer = BinaryObjectSerializer::begin(entries.len(), self.writer)?;
 
