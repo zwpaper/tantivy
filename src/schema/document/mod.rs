@@ -161,6 +161,8 @@
 
 mod de;
 mod default_document;
+#[cfg(test)]
+mod e010_precheck;
 mod erased;
 mod existing_type_impls;
 mod owned_value;
