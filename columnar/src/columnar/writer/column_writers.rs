@@ -35,38 +35,102 @@ pub struct ColumnWriter {
     values: ExpUnrolledLinkedList,
 }
 
+/// Marks a new doc id that has no value in the column being reordered.
+const NO_VALUE_RANGE: (u32, u32) = (u32::MAX, 0);
+
+/// Scratch space reused by [`ColumnWriter::operation_iterator`] to reorder a column's
+/// operations by new doc id.
+///
+/// A single instance is kept for the whole `ColumnarWriter::serialize` call, so the
+/// `O(num_docs)` index and the reordered byte buffer are allocated once per segment
+/// finalize rather than once per column.
+#[derive(Default)]
+pub(super) struct ColumnReorderBuffers {
+    /// The column operations, serialized in increasing new doc id order.
+    reordered: Vec<u8>,
+    /// Byte range of the serialized values of each new doc id, indexed by new doc id.
+    /// `NO_VALUE_RANGE` marks a doc without a value in the column being reordered.
+    value_ranges: Vec<(u32, u32)>,
+}
+
+impl ColumnReorderBuffers {
+    /// Rewrites `column_ops` (a column's operations, serialized, grouped by increasing old
+    /// doc id and each group starting with a `NewDoc` op) so that the groups appear in
+    /// increasing new doc id order, and returns the rewritten bytes.
+    ///
+    /// `old_to_new_ids` is a permutation of `0..num_docs` (`doc_id_mapping.rs`), so each
+    /// group can be copied verbatim into its new position. Copying whole groups keeps the
+    /// stable order of the values inside a row, and docs without a value in this column
+    /// emit nothing, so the emitted `NewDoc` ids stay strictly increasing.
+    fn remap<'a, V: SymbolValue>(
+        &'a mut self,
+        column_ops: &[u8],
+        old_to_new_ids: &[RowId],
+    ) -> &'a [u8] {
+        let ColumnReorderBuffers {
+            reordered,
+            value_ranges,
+        } = self;
+        let num_docs = old_to_new_ids.len();
+        if value_ranges.len() < num_docs {
+            value_ranges.resize(num_docs, NO_VALUE_RANGE);
+        }
+        value_ranges[..num_docs].fill(NO_VALUE_RANGE);
+
+        // Pass 1: remap the `NewDoc` ids and record the byte range of each group's values.
+        let mut cursor: &[u8] = column_ops;
+        let mut offset = 0usize;
+        let mut previous_new_doc: Option<RowId> = None;
+        while let Some(op) = ColumnOperation::<V>::deserialize(&mut cursor) {
+            let op_start = offset;
+            offset = column_ops.len() - cursor.len();
+            if let ColumnOperation::NewDoc(old_doc) = op {
+                if let Some(previous_new_doc) = previous_new_doc {
+                    value_ranges[previous_new_doc as usize].1 = op_start as u32;
+                }
+                let new_doc = old_to_new_ids[old_doc as usize];
+                value_ranges[new_doc as usize] = (offset as u32, 0);
+                previous_new_doc = Some(new_doc);
+            }
+        }
+        if let Some(previous_new_doc) = previous_new_doc {
+            value_ranges[previous_new_doc as usize].1 = offset as u32;
+        }
+
+        // Pass 2: emit the groups in increasing new doc id order.
+        reordered.clear();
+        for (new_doc, &(values_start, values_end)) in value_ranges[..num_docs].iter().enumerate() {
+            if values_start == NO_VALUE_RANGE.0 {
+                continue;
+            }
+            let new_doc_op = ColumnOperation::<V>::NewDoc(new_doc as RowId);
+            reordered.extend_from_slice(new_doc_op.serialize().as_ref());
+            reordered.extend_from_slice(&column_ops[values_start as usize..values_end as usize]);
+        }
+        reordered
+    }
+}
+
 impl ColumnWriter {
     /// Returns an iterator over the Symbol that have been recorded
     /// for the given column.
+    ///
+    /// When `old_to_new_ids_opt` is set, the operations are reordered by new doc id
+    /// using `reorder_buffers` (see [`ColumnReorderBuffers::remap`]).
     pub(super) fn operation_iterator<'a, V: SymbolValue>(
         &self,
         arena: &MemoryArena,
         old_to_new_ids_opt: Option<&[RowId]>,
         buffer: &'a mut Vec<u8>,
+        reorder_buffers: &'a mut ColumnReorderBuffers,
     ) -> impl Iterator<Item = ColumnOperation<V>> + 'a + use<'a, V> {
         buffer.clear();
         self.values.read_to_end(arena, buffer);
-        if let Some(old_to_new_ids) = old_to_new_ids_opt {
-            // TODO avoid the extra deserialization / serialization.
-            let mut sorted_ops: Vec<(RowId, ColumnOperation<V>)> = Vec::new();
-            let mut new_doc = 0u32;
-            let mut cursor = &buffer[..];
-            for op in std::iter::from_fn(|| ColumnOperation::<V>::deserialize(&mut cursor)) {
-                if let ColumnOperation::NewDoc(doc) = &op {
-                    new_doc = old_to_new_ids[*doc as usize];
-                    sorted_ops.push((new_doc, ColumnOperation::NewDoc(new_doc)));
-                } else {
-                    sorted_ops.push((new_doc, op));
-                }
-            }
-            // stable sort is crucial here.
-            sorted_ops.sort_by_key(|(new_doc_id, _)| *new_doc_id);
-            buffer.clear();
-            for (_, op) in sorted_ops {
-                buffer.extend_from_slice(op.serialize().as_ref());
-            }
-        }
-        let mut cursor: &[u8] = &buffer[..];
+        let column_ops: &[u8] = match old_to_new_ids_opt {
+            Some(old_to_new_ids) => reorder_buffers.remap::<V>(buffer, old_to_new_ids),
+            None => buffer,
+        };
+        let mut cursor: &[u8] = column_ops;
         std::iter::from_fn(move || ColumnOperation::deserialize(&mut cursor))
     }
 
@@ -234,9 +298,10 @@ impl NumericalColumnWriter {
         arena: &MemoryArena,
         old_to_new_ids: Option<&[RowId]>,
         buffer: &'a mut Vec<u8>,
+        reorder_buffers: &'a mut ColumnReorderBuffers,
     ) -> impl Iterator<Item = ColumnOperation<NumericalValue>> + 'a + use<'a> {
         self.column_writer
-            .operation_iterator(arena, old_to_new_ids, buffer)
+            .operation_iterator(arena, old_to_new_ids, buffer, reorder_buffers)
     }
 }
 
@@ -280,9 +345,10 @@ impl StrOrBytesColumnWriter {
         arena: &MemoryArena,
         old_to_new_ids: Option<&[RowId]>,
         byte_buffer: &'a mut Vec<u8>,
+        reorder_buffers: &'a mut ColumnReorderBuffers,
     ) -> impl Iterator<Item = ColumnOperation<UnorderedId>> + 'a + use<'a> {
         self.column_writer
-            .operation_iterator(arena, old_to_new_ids, byte_buffer)
+            .operation_iterator(arena, old_to_new_ids, byte_buffer, reorder_buffers)
     }
 }
 

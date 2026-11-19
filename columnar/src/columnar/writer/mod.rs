@@ -18,7 +18,7 @@ use crate::column_index::{SerializableColumnIndex, SerializableOptionalIndex};
 use crate::column_values::{MonotonicallyMappableToU64, MonotonicallyMappableToU128};
 use crate::columnar::column_type::ColumnType;
 use crate::columnar::writer::column_writers::{
-    ColumnWriter, NumericalColumnWriter, StrOrBytesColumnWriter,
+    ColumnReorderBuffers, ColumnWriter, NumericalColumnWriter, StrOrBytesColumnWriter,
 };
 use crate::columnar::writer::value_index::{IndexBuilder, PreallocatedIndexBuilders};
 use crate::dictionary::{DictionaryBuilder, TermIdMapping, UnorderedId};
@@ -92,12 +92,19 @@ impl ColumnarWriter {
     pub fn sort_order(&self, sort_field: &str, num_docs: RowId, reversed: bool) -> Vec<u32> {
         let sort_field_bytes = sort_field.as_bytes();
         let mut symbols_buffer = Vec::new();
+        // Unused here (`old_to_new_ids` is `None`), but required by `operation_iterator`.
+        let mut reorder_buffers = ColumnReorderBuffers::default();
         if let Some(numerical_col_writer) = self
             .numerical_field_hash_map
             .get::<NumericalColumnWriter>(sort_field_bytes)
         {
             return collect_numerical_sort_order(
-                numerical_col_writer.operation_iterator(&self.arena, None, &mut symbols_buffer),
+                numerical_col_writer.operation_iterator(
+                    &self.arena,
+                    None,
+                    &mut symbols_buffer,
+                    &mut reorder_buffers,
+                ),
                 num_docs,
                 reversed,
             );
@@ -113,6 +120,7 @@ impl ColumnarWriter {
                     &self.arena,
                     None,
                     &mut symbols_buffer,
+                    &mut reorder_buffers,
                 ),
                 num_docs,
                 reversed,
@@ -131,7 +139,12 @@ impl ColumnarWriter {
         let dictionary_builder = &self.dictionaries[str_or_bytes_column.dictionary_id as usize];
         let term_id_mapping = dictionary_builder.build_term_id_mapping(&self.arena);
         collect_sort_order_from_ops(
-            str_or_bytes_column.operation_iterator(&self.arena, None, &mut symbols_buffer),
+            str_or_bytes_column.operation_iterator(
+                &self.arena,
+                None,
+                &mut symbols_buffer,
+                &mut reorder_buffers,
+            ),
             num_docs,
             reversed,
             |uid| Some(term_id_mapping.to_ord(uid).0),
@@ -363,6 +376,7 @@ impl ColumnarWriter {
         columns.sort_unstable_by_key(|(column_name, col_type, _)| (*column_name, *col_type));
         let (arena, buffers, dictionaries) = (&self.arena, &mut self.buffers, &self.dictionaries);
         let mut symbol_byte_buffer: Vec<u8> = Vec::new();
+        let mut reorder_buffers = ColumnReorderBuffers::default();
         for (column_name, column_type, addr) in columns {
             if column_name.contains(&JSON_END_OF_PATH) {
                 // Tantivy uses b'0' as a separator for nested fields in JSON.
@@ -383,6 +397,7 @@ impl ColumnarWriter {
                             arena,
                             old_to_new_row_ids,
                             &mut symbol_byte_buffer,
+                            &mut reorder_buffers,
                         ),
                         buffers,
                         &mut column_serializer,
@@ -401,6 +416,7 @@ impl ColumnarWriter {
                             arena,
                             old_to_new_row_ids,
                             &mut symbol_byte_buffer,
+                            &mut reorder_buffers,
                         ),
                         buffers,
                         &mut column_serializer,
@@ -430,6 +446,7 @@ impl ColumnarWriter {
                             arena,
                             old_to_new_row_ids,
                             &mut symbol_byte_buffer,
+                            &mut reorder_buffers,
                         ),
                         buffers,
                         &self.arena,
@@ -458,6 +475,7 @@ impl ColumnarWriter {
                                 arena,
                                 old_to_new_row_ids,
                                 &mut symbol_byte_buffer,
+                                &mut reorder_buffers,
                             ),
                             buffers,
                             &mut column_serializer,
@@ -478,6 +496,7 @@ impl ColumnarWriter {
                             arena,
                             old_to_new_row_ids,
                             &mut symbol_byte_buffer,
+                            &mut reorder_buffers,
                         ),
                         buffers,
                         &mut column_serializer,
@@ -857,6 +876,7 @@ mod tests {
     use stacker::MemoryArena;
 
     use crate::columnar::writer::column_operation::ColumnOperation;
+    use crate::columnar::writer::column_writers::ColumnReorderBuffers;
     use crate::{Cardinality, NumericalValue};
 
     #[test]
@@ -868,8 +888,9 @@ mod tests {
         column_writer.record(2u32, NumericalValue::from(-16i64), &mut arena);
         assert_eq!(column_writer.get_cardinality(3), Cardinality::Full);
         let mut buffer = Vec::new();
+        let mut reorder_buffers = ColumnReorderBuffers::default();
         let symbols: Vec<ColumnOperation<NumericalValue>> = column_writer
-            .operation_iterator(&arena, None, &mut buffer)
+            .operation_iterator(&arena, None, &mut buffer, &mut reorder_buffers)
             .collect();
         assert_eq!(symbols.len(), 6);
         assert!(matches!(symbols[0], ColumnOperation::NewDoc(0u32)));
@@ -897,8 +918,9 @@ mod tests {
         column_writer.record(2u32, NumericalValue::from(-16i64), &mut arena);
         assert_eq!(column_writer.get_cardinality(3), Cardinality::Optional);
         let mut buffer = Vec::new();
+        let mut reorder_buffers = ColumnReorderBuffers::default();
         let symbols: Vec<ColumnOperation<NumericalValue>> = column_writer
-            .operation_iterator(&arena, None, &mut buffer)
+            .operation_iterator(&arena, None, &mut buffer, &mut reorder_buffers)
             .collect();
         assert_eq!(symbols.len(), 4);
         assert!(matches!(symbols[0], ColumnOperation::NewDoc(1u32)));
@@ -920,8 +942,9 @@ mod tests {
         column_writer.record(0u32, NumericalValue::from(15i64), &mut arena);
         assert_eq!(column_writer.get_cardinality(2), Cardinality::Optional);
         let mut buffer = Vec::new();
+        let mut reorder_buffers = ColumnReorderBuffers::default();
         let symbols: Vec<ColumnOperation<NumericalValue>> = column_writer
-            .operation_iterator(&arena, None, &mut buffer)
+            .operation_iterator(&arena, None, &mut buffer, &mut reorder_buffers)
             .collect();
         assert_eq!(symbols.len(), 2);
         assert!(matches!(symbols[0], ColumnOperation::NewDoc(0u32)));
@@ -932,6 +955,41 @@ mod tests {
     }
 
     #[test]
+    fn test_column_writer_remap_orders_groups_by_new_doc() {
+        let mut arena = MemoryArena::default();
+        let mut column_writer = super::ColumnWriter::default();
+        // Docs 1 and 3 have no value in this column, doc 0 is multivalued.
+        column_writer.record(0u32, NumericalValue::from(10i64), &mut arena);
+        column_writer.record(0u32, NumericalValue::from(11i64), &mut arena);
+        column_writer.record(2u32, NumericalValue::from(20i64), &mut arena);
+        column_writer.record(4u32, NumericalValue::from(40i64), &mut arena);
+        // old doc -> new doc: 0 -> 3, 2 -> 0, 4 -> 1.
+        let old_to_new_ids: Vec<u32> = vec![3, 4, 0, 2, 1];
+        let mut buffer = Vec::new();
+        let mut reorder_buffers = ColumnReorderBuffers::default();
+        let symbols: Vec<ColumnOperation<NumericalValue>> = column_writer
+            .operation_iterator(
+                &arena,
+                Some(&old_to_new_ids),
+                &mut buffer,
+                &mut reorder_buffers,
+            )
+            .collect();
+        assert_eq!(
+            symbols,
+            vec![
+                ColumnOperation::NewDoc(0),
+                ColumnOperation::Value(NumericalValue::I64(20)),
+                ColumnOperation::NewDoc(1),
+                ColumnOperation::Value(NumericalValue::I64(40)),
+                ColumnOperation::NewDoc(3),
+                ColumnOperation::Value(NumericalValue::I64(10)),
+                ColumnOperation::Value(NumericalValue::I64(11)),
+            ]
+        );
+    }
+
+    #[test]
     fn test_column_writer_multivalued() {
         let mut arena = MemoryArena::default();
         let mut column_writer = super::ColumnWriter::default();
@@ -939,8 +997,9 @@ mod tests {
         column_writer.record(0u32, NumericalValue::from(17i64), &mut arena);
         assert_eq!(column_writer.get_cardinality(1), Cardinality::Multivalued);
         let mut buffer = Vec::new();
+        let mut reorder_buffers = ColumnReorderBuffers::default();
         let symbols: Vec<ColumnOperation<NumericalValue>> = column_writer
-            .operation_iterator(&arena, None, &mut buffer)
+            .operation_iterator(&arena, None, &mut buffer, &mut reorder_buffers)
             .collect();
         assert_eq!(symbols.len(), 3);
         assert!(matches!(symbols[0], ColumnOperation::NewDoc(0u32)));
