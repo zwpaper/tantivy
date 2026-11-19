@@ -218,6 +218,14 @@ impl StoreReader {
         }
 
         let compressed_block = self.get_compressed_block(checkpoint)?;
+        // For an uncompressed store the block read back from the file *is* the block:
+        // `Decompressor::None` would only copy it into a fresh `Vec`. Return the
+        // zero-copy slice directly instead of paying that redundant full-block copy.
+        if self.decompressor == Decompressor::None {
+            self.cache
+                .put_into_cache(cache_key, compressed_block.clone());
+            return Ok(compressed_block);
+        }
         let decompressed_block =
             OwnedBytes::new(self.decompressor.decompress(compressed_block.as_ref())?);
 
@@ -401,6 +409,13 @@ impl StoreReader {
             .read_bytes_async()
             .await?;
 
+        // See `read_block`: uncompressed blocks need no decompression pass or copy.
+        if self.decompressor == Decompressor::None {
+            self.cache
+                .put_into_cache(cache_key, compressed_block.clone());
+            return Ok(compressed_block);
+        }
+
         let decompressor = self.decompressor;
         let maybe_decompressed_block = executor
             .spawn_blocking(move || decompressor.decompress(compressed_block.as_ref()))
@@ -502,6 +517,47 @@ mod tests {
         assert_eq!(store.cache_stats().cache_misses, 2);
 
         assert_eq!(store.cache.peek_lru(), Some(232206));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_block_none_is_zero_copy_and_byte_identical() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let path = Path::new("store");
+        let writer = directory.open_write(path)?;
+        write_lorem_ipsum_store(writer, 500, Compressor::None, BLOCK_SIZE, true);
+        let store_file = directory.open_read(path)?;
+        let store = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY)?;
+
+        // The backing file buffer. A zero-copy block read must alias a slice of it.
+        let data = store.block_data()?;
+        let data_start = data.as_ptr() as usize;
+        let data_end = data_start + data.len();
+
+        for doc_id in 0..500u32 {
+            let checkpoint = store.block_checkpoint(doc_id)?;
+
+            // Reference: the pre-change path, i.e. copy the block through the
+            // `Decompressor::None` arm. The fast path must return the same bytes.
+            let compressed = store.get_compressed_block(&checkpoint)?;
+            let copied = Decompressor::None.decompress(compressed.as_ref())?;
+
+            let block = store.read_block(&checkpoint)?;
+            assert_eq!(
+                block.as_ref(),
+                copied.as_slice(),
+                "block for doc {doc_id} differs from the decompressed bytes"
+            );
+
+            // Zero-copy: the returned block must alias the backing file allocation
+            // instead of being a freshly allocated copy.
+            let block_start = block.as_ptr() as usize;
+            assert!(
+                block_start >= data_start && block_start + block.len() <= data_end,
+                "block for doc {doc_id} is not a slice of the backing file (it was copied)"
+            );
+        }
 
         Ok(())
     }
